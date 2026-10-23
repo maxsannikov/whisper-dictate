@@ -4,7 +4,7 @@ Linux voice dictation and file transcription using faster-whisper, with a user s
 
 ## Status
 
-This is a local repository preparation snapshot. Confirmed repository name: **Whisper Dictate** (GitHub slug `whisper-dictate`), owner `maxsannikov`, public visibility requested. The exact URL is not yet verified, GitHub CLI authentication is inactive, no remote is configured, and nothing has been published.
+**Whisper Dictate** is a public GitHub repository for Linux voice dictation and transcription. Repository: <https://github.com/maxsannikov/whisper-dictate>.
 
 ## Install
 

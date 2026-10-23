@@ -38,7 +38,15 @@ class UserGuideWiringTests(unittest.TestCase):
         self.assertIn("WantedBy=graphical-session.target", tray)
         self.assertIn("графический сеанс", guide)
 
-    def test_no_unverified_github_url(self):
+    def test_verified_github_url_is_wired_to_menu_safely(self):
         guide = (ROOT / "docs/guide.md").read_text(encoding="utf-8")
-        self.assertIn("проверенной GitHub-ссылки нет", guide)
-        self.assertNotIn("github.com/", guide)
+        source = (ROOT / "scripts/whisper-tray.py").read_text(encoding="utf-8")
+        url = "https://github.com/maxsannikov/whisper-dictate"
+        self.assertIn(f"]({url})", guide)
+        self.assertIn(f'github_url = "{url}"', source)
+        guide_item = source.index('Gtk.MenuItem(label="⌨️ Горячие клавиши и установка")')
+        github_item = source.index('Gtk.MenuItem(label="🌐 GitHub проекта")')
+        self.assertGreater(github_item, guide_item)
+        handler = source[source.index("def open_project_github") : github_item]
+        self.assertIn('subprocess.Popen(["xdg-open", github_url])', handler)
+        self.assertNotIn("shell=True", handler)

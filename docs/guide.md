@@ -56,6 +56,6 @@ systemctl --user start whisper-tray.service
 - **Ошибка демона:** проверьте `systemctl --user status whisper-daemon.service`, журнал, наличие исполняемого `~/.local/bin/whisper/whisper-daemon.py` и сокета `~/.cache/whisper-dictate/daemon.sock`. Не отправляйте логи, содержащие пользовательский текст или приватные пути.
 - **CPU или GPU:** конфигурация задаёт `device` и `compute_type`; безопасные runtime-метаданные задания можно смотреть в `~/.cache/whisper-dictate/jobs/*.json` (поля backend/device/compute_type). CUDA-сбой может привести к fallback на CPU. Это не доказывает backend завершённого старого запуска, если его метаданные не сохранились. Не публикуйте аудио, распознанный текст, credential-файлы или токены.
 
-## Отдельный GitHub-репозиторий
+## GitHub проекта
 
-Локальная подготовка отдельной чистой структуры выполняется отдельно от LinuxBrain. Репозиторий пока не опубликован и проверенной GitHub-ссылки нет; ссылка появится только после согласования владельца, точного имени и видимости, создания репозитория и явного подтверждения публикации.
+Публичный репозиторий: [Whisper Dictate](https://github.com/maxsannikov/whisper-dictate). Его также можно открыть из меню трея пунктом **«🌐 GitHub проекта»**.

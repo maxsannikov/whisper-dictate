@@ -4043,6 +4043,18 @@ guide_item = Gtk.MenuItem(label="⌨️ Горячие клавиши и уст�
 guide_item.connect("activate", open_user_guide)
 menu.append(guide_item)
 
+github_url = "https://github.com/maxsannikov/whisper-dictate"
+
+def open_project_github(_item):
+    try:
+        subprocess.Popen(["xdg-open", github_url])
+    except Exception as exc:
+        log_debug(f"✗ Не удалось открыть страницу GitHub: {exc}")
+
+github_item = Gtk.MenuItem(label="🌐 GitHub проекта")
+github_item.connect("activate", open_project_github)
+menu.append(github_item)
+
 menu.append(Gtk.SeparatorMenuItem())
 quit_item = Gtk.MenuItem(label="Выход")
 quit_item.connect("activate", lambda _: Gtk.main_quit())
