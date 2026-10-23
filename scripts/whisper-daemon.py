@@ -67,6 +67,8 @@ def config():
                 raise ValueError("root")
             for key in value:
                 if key in raw: value[key] = raw[key]
+            if "cloudflare_asr_enabled" not in raw and isinstance(raw.get("cloudflare_workers_ai_enabled"), bool):
+                value["cloudflare_asr_enabled"] = raw["cloudflare_workers_ai_enabled"]
         except (OSError, ValueError, json.JSONDecodeError):
             logger.warning("Invalid configuration; safe defaults used")
             return clone_default()
@@ -456,6 +458,7 @@ async def run(job):
         if provider == "cloudflare":
             # The daemon worker serializes ASR and correction jobs, so its
             # cached Whisper/Qwen instances are idle and safe to release here.
+            await prepare_remote_models(value["corrector"]["model"])
             async def local_transcribe():
                 nonlocal cold
                 update_job_backend(job.get("job_id"), "local", value)
@@ -478,11 +481,14 @@ async def run(job):
             return {"status":"error","message":"Empty transcription","error_code":"empty_transcription",
                     **{k:value[k] for k in ("model","device","compute_type")}}
         corrector, large_cpu_corrector = large_corrector_profile(value)
-        if provider == "cloudflare" and value["cloudflare_corrector"].get("enabled"):
-            # ASR is finished; neither the local transcript model nor a
-            # previously cached Ollama model is needed by Cloudflare.
+        cloud_corrector = (value["cloudflare_corrector"]
+                           if job.get("source") == "live_dictation" else {"enabled": False})
+        if cloud_corrector.get("enabled"):
+            # Remote correction is live-dictation-only and runs after both
+            # local Whisper and Ollama have been released.
             update_job_backend(job.get("job_id"), "cloudflare", value,
-                               value["cloudflare_corrector"]["model"], stage="correction")
+                               cloud_corrector["model"], stage="correction")
+            await prepare_remote_models(corrector["model"])
         elif corrector.get("enabled") and not large_cpu_corrector:
             # Local Qwen may need the GPU; after remote ASR success let the
             # lease-guarded 2-second release finish before loading it.
@@ -493,7 +499,7 @@ async def run(job):
         if large_cpu_corrector:
             await asyncio.to_thread(unload_corrector_model, corrector["model"])
         text, correction_fallback, correction_seconds, correction_backend, correction_usage = await asyncio.to_thread(
-            correct_text_sync, text, corrector, value["cloudflare_corrector"],
+            correct_text_sync, text, corrector, cloud_corrector,
             lambda backend: update_job_backend(job.get("job_id"), backend, value,
                                                value["cloudflare_corrector"]["model"], stage="correction"))
         if correction_backend == "cloudflare":

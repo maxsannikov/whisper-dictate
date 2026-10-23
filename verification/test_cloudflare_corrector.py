@@ -100,6 +100,16 @@ class CloudflareCorrectorTests(unittest.TestCase):
         self.assertEqual(result[3], "local_fallback")
         self.assertIsNone(result[4])
 
+    def test_enabled_cloudflare_corrector_is_used_when_local_toggle_is_also_enabled(self):
+        correct_text, namespace = daemon_function("correct_text_sync")
+        namespace["cloudflare_correct"] = lambda *_args: ("Synthetic complete sentence.", 4, 3)
+        result = correct_text("Synthetic complete sentence.",
+            {"enabled": True, "provider": "ollama", "prompt": ""},
+            {"enabled": True, "model": cloudflare_corrector.DEFAULT_MODEL,
+             "temperature": 0.0, "max_tokens": 512})
+        self.assertEqual(result[3], "cloudflare")
+        self.assertEqual(result[0], "Synthetic complete sentence.")
+
     def test_all_cloud_failures_fall_back_to_local(self):
         correct_text, namespace = daemon_function("correct_text_sync")
         failures = [cloudflare_corrector.CloudflareError("401"),

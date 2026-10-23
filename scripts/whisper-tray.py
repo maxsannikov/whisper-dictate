@@ -450,11 +450,12 @@ def save_voice_config(value):
 ICONS = {
     "idle": "microphone-sensitivity-high-symbolic",  # Микрофон с волнами
     "recording": "/usr/share/icons/Papirus/24x24/actions/media-record.svg",  # КРАСНЫЙ кружочек
-    "processing_gpu": "/usr/share/icons/Papirus/24x24/apps/hourglass.svg",  # Песочные часы (GPU)
-    "processing_cpu": "/usr/share/icons/Papirus/24x24/actions/clock.svg"   # Обычные часы (CPU)
+    "processing_cloudflare": "/usr/share/icons/Papirus/24x24/actions/cloud-download.svg",
+    "processing_gpu": "/usr/share/icons/Papirus/24x24/devices/input-gaming.svg",
+    "processing_cpu": "/usr/share/icons/Papirus/24x24/devices/cpu.svg"
 }
 
-DEVICE_EMOJI = {"cuda": "🔥", "cpu": "❄️", "cloudflare": "☁️", "unknown": "❔"}
+DEVICE_EMOJI = {"cuda": "🎮", "cpu": "🔥", "cloudflare": "☁️", "unknown": "❔"}
 STATE_EMOJI = {"recording": "🔴", "processing": "⏰"}
 BATCH_STATUS_LABELS = {
     "queued": "⏳ Ожидание",
@@ -3355,7 +3356,7 @@ def refresh_cloudflare_usage(*_args):
     correction_basis = "оценка токенов" if usage.get("corrector_estimated_token_requests", 0) else "usage API/токены"
     minutes = usage["audio_seconds"] / 60
     cloudflare_usage.set_label(
-        f"≈ Оценка расхода по локальным метрикам (UTC): ~{total:,} нейронов "
+        f"~{total:,} нейронов "
         f"(ASR ~{int(usage['estimated_neurons']):,}; корректор ~{int(correction):,}, {correction_basis}); "
         f"ASR ~{minutes:.1f} мин, {usage['requests']} запросов".replace(",", " "))
 
@@ -4132,23 +4133,22 @@ def poll_jobs():
     jobs_separator.set_visible(len(display_entries) > 0)
 
     # Определить иконку трея на основе состояния И device
-    if any(e["state"] == "recording" for e in display_entries):
+    processing_entries = [entry for entry in display_entries if entry["state"] == "processing"]
+    if processing_entries and any(e["device"] == "cloudflare" for e in processing_entries):
+        icon = ICONS["processing_cloudflare"]
+        tooltip = f"☁️ Обработка Cloudflare ({len(processing_entries)} активно)"
+    elif processing_entries and any(e["device"] == "cuda" for e in processing_entries):
+        icon = ICONS["processing_gpu"]
+        tooltip = f"🎮 Обработка GPU ({len(processing_entries)} активно)"
+    elif processing_entries and any(e["device"] == "cpu" for e in processing_entries):
+        icon = ICONS["processing_cpu"]
+        tooltip = f"🔥 Обработка CPU ({len(processing_entries)} активно)"
+    elif any(e["state"] == "recording" for e in display_entries):
         icon = ICONS["recording"]
         tooltip = f"🔴 Запись ({len(display_entries)} активно)"
-    elif display_entries:
-        if any(e["device"] == "cloudflare" for e in display_entries):
-            icon = ICONS["processing_gpu"]
-            tooltip = f"☁️ Обработка Cloudflare ({len(display_entries)} активно)"
-        else:
-        # При обработке выбираем иконку в зависимости от device
-        # Если есть хотя бы одно GPU — показываем песочные часы, иначе обычные часы
-            has_gpu = any(e["device"] == "cuda" for e in display_entries)
-            if has_gpu:
-                icon = ICONS["processing_gpu"]
-                tooltip = f"⏳ Обработка GPU ({len(display_entries)} активно)"
-            else:
-                icon = ICONS["processing_cpu"]
-                tooltip = f"⏰ Обработка CPU ({len(display_entries)} активно)"
+    elif processing_entries:
+        icon = ICONS["processing_cpu"]
+        tooltip = f"⚙️ Обработка ({len(processing_entries)} активно)"
     else:
         icon = ICONS["idle"]
         tooltip = "🎤 Whisper Dictate — ожидание"

@@ -130,7 +130,21 @@ class CloudflareResponseTests(unittest.TestCase):
         source = (Path(__file__).parents[1] / "scripts" / "whisper-tray.py").read_text(encoding="utf-8")
         self.assertIn("cloudflare_daily_usage(METRICS_FILE)", source)
         self.assertIn('cloudflare_submenu.connect("show", refresh_cloudflare_usage)', source)
-        self.assertIn("Оценка расхода по локальным метрикам (UTC)", source)
+        self.assertNotIn("Оценка расхода по локальным метрикам", source)
+        self.assertIn("~{total:,} нейронов", source)
+
+    def test_tray_uses_single_cloud_gpu_or_cpu_status_icon(self):
+        source = (Path(__file__).parents[1] / "scripts" / "whisper-tray.py").read_text(encoding="utf-8")
+        self.assertIn('"processing_cloudflare": "/usr/share/icons/Papirus/24x24/actions/cloud-download.svg"', source)
+        self.assertIn('"processing_gpu": "/usr/share/icons/Papirus/24x24/devices/input-gaming.svg"', source)
+        self.assertIn('"processing_cpu": "/usr/share/icons/Papirus/24x24/devices/cpu.svg"', source)
+        self.assertIn('processing_entries = [entry for entry in display_entries if entry["state"] == "processing"]', source)
+
+    def test_legacy_cloudflare_toggle_and_live_fallback_routing(self):
+        daemon = (Path(__file__).parents[1] / "scripts" / "whisper-daemon.py").read_text(encoding="utf-8")
+        self.assertIn('if "cloudflare_asr_enabled" not in raw and isinstance(raw.get("cloudflare_workers_ai_enabled"), bool)', daemon)
+        self.assertIn('await prepare_remote_models(value["corrector"]["model"])', daemon)
+        self.assertIn('if job.get("source") == "live_dictation" else {"enabled": False}', daemon)
 
     def test_cloudflare_failure_delegates_to_local_only_when_enabled(self):
         calls = []

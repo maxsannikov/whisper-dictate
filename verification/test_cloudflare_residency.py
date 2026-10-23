@@ -59,7 +59,9 @@ class CloudflareResidencyTests(unittest.TestCase):
         run = SOURCE[SOURCE.index("async def run(job):"):SOURCE.index("\nasync def worker", SOURCE.index("async def run(job):"))]
         cloud_call = run.index("await cloudflare_first(")
         local_load = run.index("cold = await prepare_local_asr(value)")
+        remote_release = run.index('await prepare_remote_models(value["corrector"]["model"])')
         self.assertIn("local_transcribe, True)", run)
+        self.assertLess(remote_release, cloud_call)
         self.assertLess(local_load, cloud_call)
         self.assertNotIn('job["cloudflare_fallback_local"]', run)
         self.assertIn("await ensure(retry)", run)
@@ -68,10 +70,12 @@ class CloudflareResidencyTests(unittest.TestCase):
     def test_cloudflare_corrector_releases_whisper_after_asr(self):
         run = SOURCE[SOURCE.index("async def run(job):"):SOURCE.index("\nasync def worker", SOURCE.index("async def run(job):"))]
         asr_end = run.index("elapsed = time.monotonic() - t0")
-        correction_release = run.index("if provider == \"cloudflare\" and value[\"cloudflare_corrector\"].get(\"enabled\")")
+        correction_release = run.index("if cloud_corrector.get(\"enabled\")")
         local_qwen = run.index("correct_text_sync, text, corrector")
         self.assertLess(asr_end, correction_release)
         self.assertLess(correction_release, local_qwen)
+        self.assertIn('if job.get("source") == "live_dictation" else {"enabled": False}', run)
+        self.assertIn('await prepare_remote_models(corrector["model"])', run)
         self.assertIn("delayed_qwen_release(corrector[\"model\"])", run)
 
     def test_cloudflare_correction_error_forces_local_qwen_if_local_toggle_is_off(self):
