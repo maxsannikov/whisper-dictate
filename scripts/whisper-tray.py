@@ -3357,7 +3357,7 @@ def cloudflare_credentials_available():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, value = line.split("=", 1)
-                if value.strip().strip("\"'"):
+                if value.strip().strip("\"'").strip():
                     names.add(key.strip())
         return {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}.issubset(names)
     except OSError:
