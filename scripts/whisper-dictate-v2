@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE="$HOME/.cache/whisper-dictate"
+PIDS_DIR="$STATE/pids"
+QUEUE_DIR="$STATE/queue"
+RESULTS_DIR="$STATE/results"
+JOBS_DIR="$STATE/jobs"
+
+mkdir -p "$PIDS_DIR" "$QUEUE_DIR" "$RESULTS_DIR" "$JOBS_DIR"
+
+# Парсинг аргументов
+AUDIO_FILE=""
+BATCH_ID=""
+OUTPUT_PATH=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --file)
+            AUDIO_FILE="$2"
+            shift 2
+            ;;
+        --batch-id)
+            BATCH_ID="$2"
+            shift 2
+            ;;
+        --output)
+            OUTPUT_PATH="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Единственный источник обычного профиля — канонический конфиг. Legacy
+# quality-config.json намеренно не читается: он сохранён только для отката.
+Q_MODEL="large-v3"
+Q_BEAM=1
+Q_FP16=true
+Q_BEST_OF=1
+Q_TEMP=0.0
+Q_LANGUAGE="ru"
+Q_VAD_THRESHOLD=0.5
+# Сохраняем поле metadata для очереди заданий, не обращаясь к legacy-конфигу.
+STRATEGY="canonical"
+# Canonical privacy-safe profile.
+VOICE_CONFIG="$HOME/.config/whisper-dictate/config.json"
+AUDIO_DUCK_HELPER="$HOME/.local/bin/whisper/whisper-audio-duck.py"
+AUDIO_DUCK_ENABLED=false
+AUDIO_DUCK_TARGET=20
+AUDIO_DUCK_FADE_MS=300
+WHISPER_ASR_PROVIDER="local"
+WHISPER_CLOUDFLARE_FALLBACK="false"
+if [[ -f "$VOICE_CONFIG" ]]; then
+    mapfile -t _voice_values < <(/usr/bin/python3 - "$VOICE_CONFIG" <<'PY'
+import json, sys
+safe = {"model":"large-v3","language":"ru","device":"cuda","compute_type":"int8_float16","beam_size":1,"best_of":1,"temperature":0.0,"vad":False,"result_mode":"clipboard","cloudflare_asr_enabled":False}
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    if not isinstance(value, dict): raise ValueError
+    for key in safe:
+        if key in value: safe[key] = value[key]
+    if "cloudflare_asr_enabled" not in value:
+        safe["cloudflare_asr_enabled"] = value.get("cloudflare_workers_ai_enabled", False)
+    if safe["model"] not in {"large-v3","large-v3-turbo","medium","small"}: raise ValueError
+    if safe["device"] not in {"cuda","cpu"} or safe["compute_type"] not in {"int8_float16","float16","int8","float32"}: raise ValueError
+    if not isinstance(safe["beam_size"], int) or not 1 <= safe["beam_size"] <= 10: raise ValueError
+    if not isinstance(safe["best_of"], int) or not 1 <= safe["best_of"] <= 10: raise ValueError
+    if not isinstance(safe["temperature"], (int,float)) or not 0 <= safe["temperature"] <= 1: raise ValueError
+    if not isinstance(safe["vad"], bool) or safe["result_mode"] not in {"clipboard","autopaste"}: raise ValueError
+    if not isinstance(safe["cloudflare_asr_enabled"], bool): raise ValueError
+    value = dict(safe, audio_ducking=value.get("audio_ducking", {}))
+except Exception:
+    value = safe
+duck = value.get("audio_ducking", {})
+if not isinstance(duck, dict): duck = {}
+duck_enabled = duck.get("enabled", False)
+duck_target = duck.get("target_percent", 20)
+duck_fade = duck.get("fade_ms", 300)
+if not isinstance(duck_enabled, bool): duck_enabled = False
+if not isinstance(duck_target, int) or not 0 <= duck_target <= 100: duck_target = 20
+if not isinstance(duck_fade, int) or not 100 <= duck_fade <= 2000: duck_fade = 300
+for key in ("model","language","device","compute_type","beam_size","best_of","temperature","vad","result_mode"):
+    print(f"{key}={value[key]}")
+print(f"cloudflare_asr_enabled={str(value['cloudflare_asr_enabled']).lower()}")
+print(f"audio_duck_enabled={str(duck_enabled).lower()}")
+print(f"audio_duck_target={duck_target}")
+print(f"audio_duck_fade={duck_fade}")
+PY
+)
+    for _voice_value in "${_voice_values[@]}"; do export "WHISPER_CONFIG_${_voice_value%%=*}"="${_voice_value#*=}"; done
+    if [[ "$WHISPER_CONFIG_cloudflare_asr_enabled" == "true" ]]; then
+        WHISPER_ASR_PROVIDER="cloudflare"
+        WHISPER_CLOUDFLARE_FALLBACK="true"
+    fi
+    Q_MODEL="$WHISPER_CONFIG_model"; Q_LANGUAGE="$WHISPER_CONFIG_language"; Q_COMPUTE="$WHISPER_CONFIG_compute_type"
+    Q_BEAM="$WHISPER_CONFIG_beam_size"; Q_BEST_OF="$WHISPER_CONFIG_best_of"; Q_TEMP="$WHISPER_CONFIG_temperature"
+    AUDIO_DUCK_ENABLED="$WHISPER_CONFIG_audio_duck_enabled"; AUDIO_DUCK_TARGET="$WHISPER_CONFIG_audio_duck_target"; AUDIO_DUCK_FADE_MS="$WHISPER_CONFIG_audio_duck_fade"
+    export WHISPER_DEVICE="$WHISPER_CONFIG_device" WHISPER_VAD="$WHISPER_CONFIG_vad" WHISPER_RESULT_MODE="$WHISPER_CONFIG_result_mode"
+fi
+if [[ -n "${BATCH_ID:-}" ]]; then
+    export WHISPER_JOB_SOURCE="${WHISPER_JOB_SOURCE:-file}"
+else
+    export WHISPER_JOB_SOURCE="live_dictation"
+fi
+export WHISPER_ASR_PROVIDER WHISPER_CLOUDFLARE_FALLBACK WHISPER_JOB_SOURCE
+
+# Получить название модели из переменной окружения или конфига
+MODEL_NAME="${WHISPER_MODEL:-$Q_MODEL}"
+# Красивое отображение имени модели
+case "$MODEL_NAME" in
+    large-v3)
+        DISPLAY_MODEL="Whisper Full (Large-v3)"
+        ;;
+    large-v3-turbo)
+        DISPLAY_MODEL="Whisper Fast (Large-v3 Turbo)"
+        ;;
+    medium)
+        DISPLAY_MODEL="Whisper Medium"
+        ;;
+    small)
+        DISPLAY_MODEL="Whisper Fast (Small)"
+        ;;
+    *)
+        DISPLAY_MODEL="Whisper ($MODEL_NAME)"
+        ;;
+esac
+
+# Маппинг fp16 → compute_type
+[[ -n "${WHISPER_CONFIG_compute_type:-}" ]] || { [[ "$Q_FP16" == "true" ]] && Q_COMPUTE="int8_float16" || Q_COMPUTE="float32"; }
+
+# Маппинг language для демона
+# Если Auto, не передавать language (демон использует default)
+case "$Q_LANGUAGE" in
+    "Auto"|"auto") Q_LANGUAGE_CODE="ru" ;;
+    "Русский"|"ru") Q_LANGUAGE_CODE="ru" ;;
+    "English"|"en") Q_LANGUAGE_CODE="en" ;;
+    *) Q_LANGUAGE_CODE="ru" ;;
+esac
+
+# Экспортировать параметры качества в окружение для использования демоном/whisper-run
+export WHISPER_MODEL="$MODEL_NAME"
+export WHISPER_BEAM_SIZE="$Q_BEAM"
+export WHISPER_COMPUTE_TYPE="$Q_COMPUTE"
+export WHISPER_BEST_OF="$Q_BEST_OF"
+export WHISPER_TEMPERATURE="$Q_TEMP"
+export WHISPER_LANGUAGE="$Q_LANGUAGE_CODE"
+export WHISPER_VAD_THRESHOLD="$Q_VAD_THRESHOLD"
+export WHISPER_VAD="${WHISPER_VAD:-0}"
+
+# =========================
+# Helper: управление файлами состояния задач
+# =========================
+write_job() {
+    # Batch-файлы отслеживаются отдельно в batch-jobs/ на стороне whisper-tray.py —
+    # не пишем сюда, чтобы не создавать дублирующиеся записи в трее
+    [[ -n "$BATCH_ID" ]] && return 0
+    local ts="$1" state="$2" device="${3:-unknown}" file_path="${4:-}" strategy="${5:-normal}" source="${6:-microphone}"
+    local tmp="$JOBS_DIR/${ts}.json.tmp.$$"
+
+    # Базовая структура для микрофона
+    local job_json="{\"model\":\"$MODEL_NAME\",\"state\":\"$state\",\"device\":\"$device\",\"started_ts\":$(date +%s),\"source\":\"$source\",\"strategy\":\"$strategy\""
+
+    # Добавить path файла если это распознавание файла
+    if [[ -n "$file_path" ]]; then
+        job_json="$job_json,\"file\":\"$file_path\""
+    fi
+
+    job_json="$job_json}"
+
+    printf '%s\n' "$job_json" > "$tmp" 2>/dev/null && mv -f "$tmp" "$JOBS_DIR/${ts}.json" 2>/dev/null || true
+}
+
+remove_job() {
+    [[ -n "$BATCH_ID" ]] && return 0
+    rm -f "$JOBS_DIR/${1}.json" 2>/dev/null || true
+}
+
+# Удалить исходный audio-файл ТОЛЬКО если это временная запись микрофона
+# (rec-*.wav в $STATE). Пользовательские файлы, переданные через --file
+# (обычный режим и batch), НИКОГДА не удаляются — иначе транскрибация файла
+# стирала бы оригинал пользователя.
+cleanup_wav() {
+    local wav="$1"
+    [[ -z "$AUDIO_FILE" ]] && rm -f "$wav"
+}
+
+# =========================
+# Helper: найти последний активный PID
+# =========================
+find_last_pid() {
+    local last_pid=""
+    local last_time=0
+
+    for pidfile in "$PIDS_DIR"/*.pid; do
+        [[ -f "$pidfile" ]] || continue
+
+        local mtime=$(stat -c %Y "$pidfile" 2>/dev/null || echo 0)
+        if [[ $mtime -gt $last_time ]]; then
+            last_time=$mtime
+            last_pid=$(cat "$pidfile" 2>/dev/null || echo "")
+        fi
+    done
+
+    echo "$last_pid"
+}
+
+# =========================
+# Helper: check if процесс живой
+# =========================
+is_alive() {
+    local pid=$1
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# =========================
+# Helper: добавить в историю Plasma Clipboard через SQLite
+# =========================
+add_to_clipboard_history() {
+    local text="$1"
+    local model_name="$2"
+    local history_db="$HOME/.local/share/klipper/history3.sqlite"
+
+    # Проверить наличие БД
+    if [[ ! -f "$history_db" ]]; then
+        return 0
+    fi
+
+    # Проверить наличие sqlite3
+    if ! command -v sqlite3 &>/dev/null; then
+        return 0
+    fi
+
+    # Для безопасности экранируем кавычки в тексте
+    local escaped_text="${text//\'/\'\'}"
+
+    # Сгенерировать UUID (формат для Plasma Clipboard)
+    local uuid=$(cat /proc/sys/kernel/random/uuid)
+
+    # Текущее время Unix (в секундах, как требует Plasma)
+    local timestamp=$(date +%s)
+
+    # Добавить в таблицу main (соответствует структуре Plasma Clipboard)
+    sqlite3 "$history_db" \
+        "INSERT INTO main (uuid, added_time, mimetypes, text) VALUES ('$uuid', $timestamp, 'text/plain', '$escaped_text');" \
+        2>/dev/null || true
+
+    # Добавить в таблицу aux для поддержки MIME типов
+    sqlite3 "$history_db" \
+        "INSERT INTO aux (uuid, mimetype, data_uuid) VALUES ('$uuid', 'text/plain', '$uuid');" \
+        2>/dev/null || true
+}
+
+# =========================
+# Helper: сохранить в JSONL историю транскрипций
+# =========================
+append_history() {
+    local ts="$1" model="$2" mode="$3" device="$4" text="$5" duration_ms="$6"
+    local hist_file="$STATE/history.jsonl"
+    local cap=1000
+
+    jq -nc --arg ts "$ts" --arg model "$model" --arg mode "$mode" \
+           --arg device "$device" --arg text "$text" --argjson duration_ms "$duration_ms" \
+        '{ts: ($ts|tonumber/1000000000|floor), iso: (now|todate),
+          model: $model, mode: $mode, device: $device, text: $text,
+          duration_ms: $duration_ms}' \
+        >> "$hist_file" 2>/dev/null || true
+
+    if [[ -f "$hist_file" ]] && (( $(wc -l < "$hist_file") > cap )); then
+        tail -n "$cap" "$hist_file" > "$hist_file.tmp" 2>/dev/null \
+            && mv -f "$hist_file.tmp" "$hist_file" || true
+    fi
+}
+
+# =========================
+# Async transcriber (запускается в фоне)
+# Сохраняет результат в RESULTS_DIR вместо прямого wl-copy
+# =========================
+async_transcribe() {
+    local wav=$1
+    local pidfile=$2
+
+    if [[ ! -f "$wav" ]]; then
+        if [[ -n "$OUTPUT_PATH" ]]; then
+            mkdir -p "$(dirname "$OUTPUT_PATH")"
+            echo "Аудиофайл не найден" > "$OUTPUT_PATH.error"
+        else
+            notify-send "$DISPLAY_MODEL" "❌ Audio file not found"
+        fi
+        local timestamp="${pidfile##*/}"
+        timestamp="${timestamp%.pid}"
+        remove_job "$timestamp"
+        return 1
+    fi
+
+    # Дождёмся, пока ffmpeg завершит запись (файл "стабилизируется")
+    sleep 0.3
+
+    # Вычислить timestamp до вызова клиента (из имени pidfile)
+    local timestamp="${pidfile##*/}"
+    timestamp="${timestamp%.pid}"
+    export WHISPER_JOB_ID="$timestamp"
+
+    # Файлы для записи режима работы и устройства
+    local mode_file="$RESULTS_DIR/${timestamp}.mode"
+    local device_file="$RESULTS_DIR/${timestamp}.device"
+    local correction_file="$RESULTS_DIR/${timestamp}.correction"
+
+    # Выполнить транскрипцию через демон (с fallback на прямой вызов)
+    local t0=$(date +%s%N)
+    local text
+    local cloudflare_enabled="${WHISPER_ASR_PROVIDER:-local}"
+    local asr_error_file="$RESULTS_DIR/${timestamp}.error"
+    if [[ "$cloudflare_enabled" == "cloudflare" ]]; then
+        : > "$STATE/cloudflare.log"
+        if ! text=$("$HOME/.local/bin/whisper/whisper-daemon-client.sh" "$wav" "$mode_file" "$device_file" "" "$correction_file" 2>"$STATE/cloudflare.log"); then
+            local error_message
+            error_message=$(tail -n 1 "$STATE/cloudflare.log" | cut -c1-180)
+            [[ -n "$error_message" ]] || error_message="Ошибка Cloudflare Workers AI"
+            printf '%s\n' "$error_message" > "$asr_error_file"
+            if [[ "$WHISPER_CLOUDFLARE_FALLBACK" == "true" ]]; then
+                echo "Cloudflare-first ASR and local fallback error: $error_message" >> "$STATE/tray.log"
+                local error_title="Whisper — Cloudflare/local"
+            else
+                echo "Cloudflare ASR error: $error_message" >> "$STATE/tray.log"
+                local error_title="Whisper — Cloudflare"
+            fi
+            if [[ -n "$OUTPUT_PATH" ]]; then printf '%s\n' "$error_message" > "$OUTPUT_PATH.error"; else notify-send "$error_title" "❌ $error_message"; fi
+            remove_job "$timestamp"; rm -f "$pidfile"; cleanup_wav "$wav"; return 1
+        fi
+    else
+        text=$("$HOME/.local/bin/whisper/whisper-daemon-client.sh" "$wav" "$mode_file" "$device_file" "" "$correction_file" 2>>"$STATE/daemon-client.log" || true)
+    fi
+    local t1=$(date +%s%N)
+    echo $(( (t1 - t0) / 1000000 )) > "$RESULTS_DIR/${timestamp}.duration"
+
+    # Обновить записи о задании с реальным device (с повторной попыткой если не готов)
+    sleep 0.1
+    local device=$(cat "$device_file" 2>/dev/null || echo "unknown")
+    # Если device ещё unknown, подождать ещё немного
+    if [[ "$device" == "unknown" ]]; then
+        sleep 0.2
+        device=$(cat "$device_file" 2>/dev/null || echo "unknown")
+    fi
+
+    # Получить mode из файла если распознавание файла
+    local mode=$(cat "$mode_file" 2>/dev/null || echo "unknown")
+    if [[ "$mode" == "file" ]]; then
+        write_job "$timestamp" "processing" "$device" "" "$STRATEGY" "file"
+    else
+        write_job "$timestamp" "processing" "$device" "" "$STRATEGY" "microphone"
+    fi
+
+    # Проверка на пустой результат
+    if [[ -z "${text// }" ]]; then
+        if [[ -n "$OUTPUT_PATH" ]]; then
+            mkdir -p "$(dirname "$OUTPUT_PATH")"
+            echo "Пустой результат транскрипции" > "$OUTPUT_PATH.error"
+            echo "[batch:$BATCH_ID] ✗ $wav — пустой результат" >> "$STATE/tray.log" 2>/dev/null || true
+        else
+            notify-send "$DISPLAY_MODEL" "❌ Empty transcription"
+        fi
+        remove_job "$timestamp"
+        rm -f "$pidfile"
+        cleanup_wav "$wav"
+        return 1
+    fi
+
+    # Batch-режим: результат идёт напрямую в output_path, без буфера обмена и уведомлений
+    # (иначе N параллельных файлов затирали бы друг другу clipboard/notify)
+    if [[ -n "$OUTPUT_PATH" ]]; then
+        mkdir -p "$(dirname "$OUTPUT_PATH")"
+        echo "$text" > "$OUTPUT_PATH"
+        echo "[batch:$BATCH_ID] ✓ $wav → $OUTPUT_PATH" >> "$STATE/tray.log" 2>/dev/null || true
+        rm -f "$pidfile"
+        cleanup_wav "$wav"
+        return 0
+    fi
+
+    # Сохранить результат в файл (для очереди результатов)
+    local result_file="$RESULTS_DIR/${timestamp}.txt"
+    echo "$text" > "$result_file"
+    if [[ "$WHISPER_ASR_PROVIDER" == "cloudflare" ]]; then
+        if [[ "$(cat "$mode_file" 2>/dev/null || true)" == "cloudflare_fallback" ]]; then
+            echo "$MODEL_NAME" > "$RESULTS_DIR/${timestamp}.model"
+        else
+            echo "@cf/openai/whisper-large-v3-turbo" > "$RESULTS_DIR/${timestamp}.model"
+        fi
+    else
+        echo "$MODEL_NAME" > "$RESULTS_DIR/${timestamp}.model"
+    fi
+
+    # Запустить обработчик результатов (если не запущен)
+    if ! pgrep -f "result_processor_loop" >/dev/null 2>&1; then
+        result_processor_loop &
+    fi
+
+    # Очистить временные файлы
+    rm -f "$pidfile"
+    cleanup_wav "$wav"
+}
+
+# =========================
+# Result processor loop (фоновый процесс обработки результатов)
+# Гарантирует очередность: результаты идут в буфер обмена в порядке создания
+# =========================
+result_processor_loop() {
+    local lock_file="$STATE/.result_lock"
+
+    while true; do
+        # Найти самый старый файл результата
+        local oldest_result=""
+        local oldest_mtime=999999999999
+
+        for result_file in "$RESULTS_DIR"/*.txt; do
+            [[ -f "$result_file" ]] || continue
+
+            local mtime=$(stat -c %Y "$result_file" 2>/dev/null || echo 0)
+            if [[ $mtime -lt $oldest_mtime ]]; then
+                oldest_mtime=$mtime
+                oldest_result="$result_file"
+            fi
+        done
+
+        # Если нашли результат, обработать его
+        if [[ -n "$oldest_result" ]] && [[ -f "$oldest_result" ]]; then
+            local text=$(cat "$oldest_result")
+            local timestamp="${oldest_result##*/}"
+            timestamp="${timestamp%.txt}"
+            local model_file="$RESULTS_DIR/${timestamp}.model"
+            local mode_file_r="$RESULTS_DIR/${timestamp}.mode"
+            local device_file_r="$RESULTS_DIR/${timestamp}.device"
+            local duration_file="$RESULTS_DIR/${timestamp}.duration"
+            local correction_file_r="$RESULTS_DIR/${timestamp}.correction"
+            local model=$(cat "$model_file" 2>/dev/null || echo "Unknown")
+            local mode=$(cat "$mode_file_r" 2>/dev/null || echo "unknown")
+            local device=$(cat "$device_file_r" 2>/dev/null || echo "unknown")
+            local duration_ms=$(cat "$duration_file" 2>/dev/null || echo 0)
+            local correction_fallback=$(cat "$correction_file_r" 2>/dev/null || true)
+
+            # Определить красивое имя модели
+            case "$model" in
+                large-v3) local display_model="Whisper Full (Large-v3)" ;;
+                medium) local display_model="Whisper Medium" ;;
+                small) local display_model="Whisper Fast (Small)" ;;
+                @cf/openai/whisper-large-v3-turbo) local display_model="Whisper Cloudflare Workers AI" ;;
+                *) local display_model="Whisper ($model)" ;;
+            esac
+
+            # Создать метку режима работы с эмодзи
+            local mode_label=""
+            if [[ "$mode" == "cloudflare_fallback" ]]; then
+                mode_label="⚠️ Cloudflare недоступен; распознано локально"
+            elif [[ "$device" == "cloudflare" ]]; then
+                mode_label="☁️ Аудио отправлено в Cloudflare"
+            else
+            case "${mode}_${device}" in
+                daemon_cuda) mode_label="⚡ Демон (GPU)" ;;
+                daemon_cpu)  mode_label="⚡ Демон (CPU?!)" ;;
+                direct_cuda) mode_label="🐢 Прямой (GPU)" ;;
+                direct_cpu)  mode_label="🔥 Прямой (CPU, медленно!)" ;;
+                *)
+                    case "$mode" in
+                        daemon) mode_label="⚡ Демон" ;;
+                        direct) mode_label="🐢 Прямой" ;;
+                        *)      mode_label="" ;;
+                    esac
+                    ;;
+            esac
+            fi
+
+            if [[ "${XDG_SESSION_TYPE:-wayland}" == "wayland" ]]; then
+                printf '%s' "$text" | wl-copy 2>/dev/null
+            elif [[ "${XDG_SESSION_TYPE:-}" == "x11" ]]; then
+                printf '%s' "$text" | xclip -selection clipboard 2>/dev/null
+            else
+                false
+            fi && {
+                echo "[$(date)] ✓ В буфер обмена успешно ($(echo -n "$text" | wc -c) байт)" >> "$STATE/autopaste.log"
+            } || {
+                echo "[$(date)] ✗ Ошибка буфера обмена: ни wl-copy ни xclip не сработали" >> "$STATE/autopaste.log"
+            }
+
+            # Show only an ephemeral preview; transcription text is never written to logs.
+            local preview
+            preview=$(printf '%s\n' "$text" | sed -n '1,2p')
+            if [[ ${#preview} -gt 240 ]]; then
+                preview="${preview:0:239}…"
+            fi
+            [[ -n "$preview" ]] || preview="(пустой результат)"
+            if [[ -n "$mode_label" ]]; then
+                notify-send "$display_model ✓ ${mode_label}" "$preview"
+            else
+                notify-send "$display_model ✓" "$preview"
+            fi
+            if [[ -n "$correction_fallback" ]]; then
+                notify-send "Whisper Dictate ⚠️ Корректор" "Часть текста не прошла проверку полноты после двух попыток. Вставлен исходный текст Whisper: фрагменты ${correction_fallback#raw_asr_after_retry:}."
+            fi
+
+            # Удалить обработанные файлы и запись о задании
+            rm -f "$oldest_result" "$model_file" "$mode_file_r" "$device_file_r" "$duration_file" "$correction_file_r"
+            remove_job "$timestamp"
+        else
+            # Нет результатов, подождать
+            sleep 0.5
+
+            # Выход из цикла если нет новых результатов в течение 30 сек
+            if [[ -z "$(ls "$RESULTS_DIR"/*.txt 2>/dev/null)" ]]; then
+                break
+            fi
+        fi
+    done
+}
+
+# =========================
+# STOP: завершить последнюю запись и начать обработку
+# =========================
+stop_recording() {
+    local last_pid
+    last_pid=$(find_last_pid)
+
+    if [[ -z "$last_pid" ]]; then
+        notify-send "$DISPLAY_MODEL" "⚠️ No active recording"
+        return 0
+    fi
+
+    # Завершить ffmpeg
+    notify-send "$DISPLAY_MODEL" "⏹️ Processing... (queued)"
+    kill "$last_pid" 2>/dev/null || true
+    [[ "$AUDIO_DUCK_ENABLED" == "true" && -x "$AUDIO_DUCK_HELPER" ]] && "$AUDIO_DUCK_HELPER" stop "$AUDIO_DUCK_TARGET" "$AUDIO_DUCK_FADE_MS" &
+
+    # Найти соответствующий файл WAV по PID
+    local pidfile
+    for pf in "$PIDS_DIR"/*.pid; do
+        if [[ -f "$pf" ]] && [[ "$(cat "$pf")" == "$last_pid" ]]; then
+            pidfile="$pf"
+            break
+        fi
+    done
+
+    [[ -z "$pidfile" ]] && return 0
+
+    local timestamp="${pidfile##*/}"
+    timestamp="${timestamp%.pid}"
+    local wav="$STATE/rec-$timestamp.wav"
+
+    # Дождёмся физического завершения ffmpeg
+    sleep 0.2
+
+    # Обновить статус задания на "processing"
+    write_job "$timestamp" "processing" "unknown" "" "$STRATEGY" "microphone"
+
+    # Запустить асинхронную транскрипцию в фоне
+    async_transcribe "$wav" "$pidfile" &
+
+    return 0
+}
+
+# =========================
+# START: начать новую запись
+# =========================
+start_recording() {
+    local timestamp
+    timestamp=$(date +%s%N)
+
+    local pidfile="$PIDS_DIR/$timestamp.pid"
+    local wav="$STATE/rec-$timestamp.wav"
+
+    notify-send "$DISPLAY_MODEL" "🎤 Recording..."
+
+    [[ "$AUDIO_DUCK_ENABLED" == "true" && -x "$AUDIO_DUCK_HELPER" ]] && "$AUDIO_DUCK_HELPER" start "$AUDIO_DUCK_TARGET" "$AUDIO_DUCK_FADE_MS" &
+
+    # Запустить запись
+    ffmpeg -f pulse -i default -ac 1 -ar 16000 \
+        -y "$wav" \
+        </dev/null >/dev/null 2>&1 &
+
+    local ffmpeg_pid=$!
+    echo "$ffmpeg_pid" > "$pidfile"
+
+    # Создать запись о начале задания
+    write_job "$timestamp" "recording" "unknown" "" "$STRATEGY" "microphone"
+}
+
+# =========================
+# MAIN LOGIC
+# =========================
+
+if [[ -n "$AUDIO_FILE" ]]; then
+    # Режим прямой обработки файла (из диалога)
+    if [[ ! -f "$AUDIO_FILE" ]]; then
+        if [[ -n "$OUTPUT_PATH" ]]; then
+            mkdir -p "$(dirname "$OUTPUT_PATH")"
+            echo "Файл не найден: $AUDIO_FILE" > "$OUTPUT_PATH.error"
+        else
+            notify-send "$DISPLAY_MODEL" "❌ Файл не найден: $AUDIO_FILE"
+        fi
+        exit 1
+    fi
+
+    # Создать pidfile и запустить транскрибацию
+    timestamp=$(date +%s%N)
+    pidfile="$PIDS_DIR/$timestamp.pid"
+    touch "$pidfile"
+
+    # Создать job-файл для отслеживания в меню
+    write_job "$timestamp" "processing" "unknown" "$AUDIO_FILE" "$STRATEGY" "file"
+
+    if [[ -n "$BATCH_ID" ]]; then
+        # Batch-режим: выполняем СИНХРОННО, чтобы exit-код процесса отражал
+        # реальный результат транскрипции — whisper-tray.py отслеживает
+        # завершение через subprocess.Popen.poll() на этом же процессе
+        async_transcribe "$AUDIO_FILE" "$pidfile"
+    else
+        notify-send "$DISPLAY_MODEL" "📁 Обработка файла..."
+        async_transcribe "$AUDIO_FILE" "$pidfile" &
+    fi
+else
+    # Обычный режим: запись через hotkey или остановка
+    last_pid=$(find_last_pid)
+
+    if [[ -n "$last_pid" ]] && is_alive "$last_pid"; then
+        # Есть активная запись → STOP
+        stop_recording
+    else
+        # Нет активной записи → START
+        start_recording
+    fi
+fi

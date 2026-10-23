@@ -1,0 +1,33 @@
+# Credentials and private configuration
+.env
+.env.*
+!.env.example
+*credentials*
+*token*
+*secret*
+config.json
+
+# Runtime data and personal content
+*.log
+*.jsonl
+history*
+metrics*
+*.wav
+*.mp3
+*.opus
+*.flac
+*.m4a
+*.mp4
+*.mkv
+*.webm
+*.srt
+*.vtt
+
+# Models, caches, and local environments
+.cache/
+cache/
+models/
+__pycache__/
+*.py[cod]
+.venv/
+venv/

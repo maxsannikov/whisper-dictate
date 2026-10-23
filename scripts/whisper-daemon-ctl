@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Управление демоном whisper: start, stop, status, restart
+
+DAEMON_SCRIPT="${HOME}/.local/bin/whisper/whisper-daemon.py"
+DAEMON_SERVICE="whisper-daemon.service"
+SOCKET="${HOME}/.cache/whisper-dictate/daemon.sock"
+LOG_FILE="${HOME}/.cache/whisper-dictate/daemon.log"
+
+COMMAND="${1:-status}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+case "$COMMAND" in
+    start)
+        echo "Starting Whisper Daemon..."
+        if systemctl --user is-active --quiet "$DAEMON_SERVICE" 2>/dev/null; then
+            echo -e "${YELLOW}Already running${NC}"
+            exit 0
+        fi
+        systemctl --user start "$DAEMON_SERVICE"
+        sleep 1
+        if [[ -S "$SOCKET" ]]; then
+            echo -e "${GREEN}✓ Daemon started${NC}"
+            tail -n 5 "$LOG_FILE" 2>/dev/null || true
+        else
+            echo -e "${RED}✗ Failed to start daemon${NC}"
+            tail -n 10 "$LOG_FILE" 2>/dev/null || true
+            exit 1
+        fi
+        ;;
+
+    stop)
+        echo "Stopping Whisper Daemon..."
+        systemctl --user stop "$DAEMON_SERVICE" 2>/dev/null || true
+        sleep 0.5
+        if [[ ! -S "$SOCKET" ]]; then
+            echo -e "${GREEN}✓ Daemon stopped${NC}"
+        else
+            echo -e "${YELLOW}Waiting for socket to close...${NC}"
+            sleep 2
+        fi
+        ;;
+
+    restart)
+        echo "Restarting Whisper Daemon..."
+        systemctl --user restart "$DAEMON_SERVICE"
+        sleep 1
+        if [[ -S "$SOCKET" ]]; then
+            echo -e "${GREEN}✓ Daemon restarted${NC}"
+            tail -n 3 "$LOG_FILE" 2>/dev/null || true
+        else
+            echo -e "${RED}✗ Failed to restart daemon${NC}"
+            tail -n 10 "$LOG_FILE" 2>/dev/null || true
+            exit 1
+        fi
+        ;;
+
+    status)
+        if systemctl --user is-active --quiet "$DAEMON_SERVICE" 2>/dev/null; then
+            STATUS="running"
+            COLOR="$GREEN"
+            SYMBOL="✓"
+        else
+            STATUS="stopped"
+            COLOR="$YELLOW"
+            SYMBOL="○"
+        fi
+
+        if [[ -S "$SOCKET" ]]; then
+            SOCKET_STATUS="ready"
+        else
+            SOCKET_STATUS="not ready"
+        fi
+
+        echo -e "${COLOR}${SYMBOL} Status: $STATUS${NC}"
+        echo "  Socket: $SOCKET_STATUS"
+
+        if [[ -f "$LOG_FILE" ]]; then
+            echo "  Log: $LOG_FILE"
+            echo ""
+            echo "Recent logs:"
+            tail -n 5 "$LOG_FILE" | sed 's/^/    /'
+        fi
+        ;;
+
+    log)
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -f "$LOG_FILE"
+        else
+            echo "Log file not found: $LOG_FILE" >&2
+            exit 1
+        fi
+        ;;
+
+    *)
+        cat >&2 <<EOF
+Usage: whisper-daemon-ctl {start|stop|restart|status|log}
+
+Commands:
+  start     — Start the daemon
+  stop      — Stop the daemon
+  restart   — Restart the daemon
+  status    — Show daemon status
+  log       — Tail the daemon log
+
+Examples:
+  whisper-daemon-ctl status
+  whisper-daemon-ctl start
+  whisper-daemon-ctl log
+
+EOF
+        exit 1
+        ;;
+esac

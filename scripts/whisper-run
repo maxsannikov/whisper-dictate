@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+WAV="${1:-}"
+DEVICE_FILE="${2:-}"
+VENV_PY="$HOME/.local/venvs/whisper/bin/python"
+
+if [[ -z "$WAV" || ! -s "$WAV" ]]; then
+  echo "ERROR: audio file missing or empty: $WAV" >&2
+  exit 2
+fi
+
+if [[ ! -x "$VENV_PY" ]]; then
+  echo "ERROR: Python venv not found: $VENV_PY" >&2
+  exit 3
+fi
+
+# CUDA 12.9 path for your current system.
+if [[ -d /usr/local/cuda-12.9/targets/x86_64-linux/lib ]]; then
+  export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.9}"
+  export LD_LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+fi
+
+MODEL="${WHISPER_MODEL:-large-v3}"
+LANGUAGE="${WHISPER_LANGUAGE:-ru}"
+DEVICE="${WHISPER_DEVICE:-cuda}"
+COMPUTE_TYPE="${WHISPER_COMPUTE_TYPE:-int8_float16}"
+VAD="${WHISPER_VAD:-1}"
+BEAM_SIZE="${WHISPER_BEAM_SIZE:-1}"
+BEST_OF="${WHISPER_BEST_OF:-1}"
+TEMPERATURE="${WHISPER_TEMPERATURE:-0.0}"
+
+run_transcribe() {
+  local device="$1"
+  local compute="$2"
+
+  WHISPER_MODEL="$MODEL" \
+  WHISPER_LANGUAGE="$LANGUAGE" \
+  WHISPER_DEVICE="$device" \
+  WHISPER_COMPUTE_TYPE="$compute" \
+  WHISPER_VAD="$VAD" \
+  WHISPER_BEAM_SIZE="$BEAM_SIZE" \
+  WHISPER_BEST_OF="$BEST_OF" \
+  WHISPER_TEMPERATURE="$TEMPERATURE" \
+  "$VENV_PY" - "$WAV" <<'PY'
+import os
+import sys
+from faster_whisper import WhisperModel
+
+audio_file = sys.argv[1]
+
+model_name = os.environ.get("WHISPER_MODEL", "large-v3")
+language = os.environ.get("WHISPER_LANGUAGE", "ru")
+device = os.environ.get("WHISPER_DEVICE", "cuda")
+compute_type = os.environ.get("WHISPER_COMPUTE_TYPE", "int8_float16")
+vad_filter = os.environ.get("WHISPER_VAD", "1").lower() not in ("0", "false", "no", "off")
+beam_size = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
+best_of = int(os.environ.get("WHISPER_BEST_OF", "1"))
+temperature = float(os.environ.get("WHISPER_TEMPERATURE", "0.0"))
+
+print(
+    f"[whisper-run] model={model_name} device={device} compute_type={compute_type} vad={vad_filter} beam_size={beam_size} best_of={best_of} temp={temperature}",
+    file=sys.stderr,
+)
+
+model = WhisperModel(
+    model_name,
+    device=device,
+    compute_type=compute_type,
+)
+
+segments, info = model.transcribe(
+    audio_file,
+    language=language,
+    vad_filter=vad_filter,
+    beam_size=beam_size,
+    best_of=best_of,
+    temperature=temperature,
+)
+
+text = "".join(segment.text for segment in segments).strip()
+
+print(f"[whisper-run] detected_language={getattr(info, 'language', None)}", file=sys.stderr)
+print(f"[whisper-run] chars={len(text)}", file=sys.stderr)
+
+if not text:
+    print("ERROR: Empty transcription after successful model run", file=sys.stderr)
+    sys.exit(10)
+
+print(text)
+PY
+}
+
+tmp_err="$(mktemp)"
+trap 'rm -f "$tmp_err"' EXIT
+
+if run_transcribe "$DEVICE" "$COMPUTE_TYPE" 2>"$tmp_err"; then
+  cat "$tmp_err" >&2
+  [[ -n "$DEVICE_FILE" ]] && echo "$DEVICE" > "$DEVICE_FILE"
+  exit 0
+fi
+
+status=$?
+cat "$tmp_err" >&2
+
+if [[ "$DEVICE" == "cuda" ]] && grep -Eqi 'libcublas|libcudnn|cuda|cudnn|cannot be loaded|not found' "$tmp_err"; then
+  echo "[whisper-run] CUDA failed; falling back to CPU int8" >&2
+  if run_transcribe cpu int8 2>"$tmp_err"; then
+    [[ -n "$DEVICE_FILE" ]] && echo "cpu" > "$DEVICE_FILE"
+    exit 0
+  else
+    exit $?
+  fi
+fi
+
+exit "$status"

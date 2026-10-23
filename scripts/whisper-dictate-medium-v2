@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec env \
+  WHISPER_DEVICE=cuda \
+  WHISPER_COMPUTE_TYPE=int8_float16 \
+  WHISPER_MODEL=medium \
+  "$SCRIPT_DIR/whisper-dictate-v2"

@@ -1,0 +1,25 @@
+[Unit]
+Description=Whisper Daemon — faster-whisper with GPU cache
+Documentation=file://%h/.local/bin/whisper/whisper-daemon.py
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/whisper/whisper-daemon.py
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Resource limits (optional, adjust to your system)
+# MemoryMax=8G
+# CPUQuota=50%
+
+StandardOutput=journal
+StandardError=journal
+
+# Environment setup
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=default.target
