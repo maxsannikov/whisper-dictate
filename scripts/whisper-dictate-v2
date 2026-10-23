@@ -55,24 +55,27 @@ WHISPER_CLOUDFLARE_FALLBACK="false"
 if [[ -f "$VOICE_CONFIG" ]]; then
     mapfile -t _voice_values < <(/usr/bin/python3 - "$VOICE_CONFIG" <<'PY'
 import json, sys
-safe = {"model":"large-v3","language":"ru","device":"cuda","compute_type":"int8_float16","beam_size":1,"best_of":1,"temperature":0.0,"vad":False,"result_mode":"clipboard","cloudflare_asr_enabled":False}
+defaults = {"model":"large-v3","language":"ru","device":"cuda","compute_type":"int8_float16","beam_size":1,"best_of":1,"temperature":0.0,"vad":False,"result_mode":"clipboard","cloudflare_asr_enabled":False}
+cloudflare_asr_enabled = False
 try:
-    value = json.load(open(sys.argv[1], encoding="utf-8"))
-    if not isinstance(value, dict): raise ValueError
-    for key in safe:
-        if key in value: safe[key] = value[key]
-    if "cloudflare_asr_enabled" not in value:
-        safe["cloudflare_asr_enabled"] = value.get("cloudflare_workers_ai_enabled", False)
-    if safe["model"] not in {"large-v3","large-v3-turbo","medium","small"}: raise ValueError
-    if safe["device"] not in {"cuda","cpu"} or safe["compute_type"] not in {"int8_float16","float16","int8","float32"}: raise ValueError
-    if not isinstance(safe["beam_size"], int) or not 1 <= safe["beam_size"] <= 10: raise ValueError
-    if not isinstance(safe["best_of"], int) or not 1 <= safe["best_of"] <= 10: raise ValueError
-    if not isinstance(safe["temperature"], (int,float)) or not 0 <= safe["temperature"] <= 1: raise ValueError
-    if not isinstance(safe["vad"], bool) or safe["result_mode"] not in {"clipboard","autopaste"}: raise ValueError
-    if not isinstance(safe["cloudflare_asr_enabled"], bool): raise ValueError
-    value = dict(safe, audio_ducking=value.get("audio_ducking", {}))
+    raw = json.load(open(sys.argv[1], encoding="utf-8"))
+    if not isinstance(raw, dict): raise ValueError
+    candidate = raw.get("cloudflare_asr_enabled", raw.get("cloudflare_workers_ai_enabled", False))
+    if isinstance(candidate, bool): cloudflare_asr_enabled = candidate
+    value = dict(defaults)
+    for key in defaults:
+        if key in raw: value[key] = raw[key]
+    if value["model"] not in {"large-v3","large-v3-turbo","medium","small"}: raise ValueError
+    if value["device"] not in {"cuda","cpu"} or value["compute_type"] not in {"int8_float16","float16","int8","float32"}: raise ValueError
+    if not isinstance(value["beam_size"], int) or not 1 <= value["beam_size"] <= 10: raise ValueError
+    if not isinstance(value["best_of"], int) or not 1 <= value["best_of"] <= 10: raise ValueError
+    if not isinstance(value["temperature"], (int,float)) or not 0 <= value["temperature"] <= 1: raise ValueError
+    if not isinstance(value["vad"], bool) or value["result_mode"] not in {"clipboard","autopaste"}: raise ValueError
+    if not isinstance(value["cloudflare_asr_enabled"], bool): raise ValueError
+    value = dict(value, audio_ducking=raw.get("audio_ducking", {}))
 except Exception:
-    value = safe
+    value = dict(defaults)
+value["cloudflare_asr_enabled"] = cloudflare_asr_enabled
 duck = value.get("audio_ducking", {})
 if not isinstance(duck, dict): duck = {}
 duck_enabled = duck.get("enabled", False)

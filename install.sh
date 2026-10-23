@@ -255,12 +255,22 @@ fi
 # ============================================================================
 log "Creating KDE menu entry..."
 
+ICON_DIR="$HOME/.local/share/pixmaps"
+APP_ICON="microphone"
+if [[ -f "$SCRIPT_DIR/assets/whisper-dictate-icon.png" ]]; then
+    mkdir -p "$ICON_DIR"
+    APP_ICON="$ICON_DIR/whisper-dictate.png"
+    cp "$SCRIPT_DIR/assets/whisper-dictate-icon.png" "$APP_ICON"
+else
+    warning "Application icon asset not found; keeping the previous icon"
+fi
+
 cat > "$DESKTOP_DIR/whisper-dictate.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=Whisper Dictate
 Comment=Voice Recognition System
-Icon=microphone
+Icon=$APP_ICON
 Exec=$WHISPER_BIN_DIR/whisper-dictate-v2
 Terminal=false
 Categories=Utility;

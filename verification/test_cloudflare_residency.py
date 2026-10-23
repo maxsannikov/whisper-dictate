@@ -2,6 +2,9 @@ import ast
 import asyncio
 import json
 import logging
+import subprocess
+import sys
+import tempfile
 import urllib
 import urllib.error
 import unittest
@@ -27,9 +30,115 @@ def daemon_function(name, **overrides):
     return namespace[name], namespace
 
 
+def load_config_function(config_path):
+    tree = ast.parse(SOURCE)
+    default = next(node for node in tree.body
+                   if isinstance(node, ast.Assign) and any(
+                       isinstance(target, ast.Name) and target.id == "DEFAULT" for target in node.targets))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in {"clone_default", "restore_local_profile_defaults", "config"}]
+    namespace = {
+        "DEFAULT_CLOUDFLARE_CORRECTOR": "@cf/qwen/qwen3-30b-a3b-fp8",
+        "MODEL_NEURON_RATES": {"@cf/qwen/qwen3-30b-a3b-fp8": (1, 1),
+                               "@cf/zai-org/glm-4.7-flash": (1, 1)},
+        "MODELS": {"large-v3", "large-v3-turbo", "medium", "small"},
+        "COMPUTES": {"int8_float16", "float16", "int8", "float32"},
+        "CONFIG": Path(config_path), "json": json, "logger": logging.getLogger("config-test"),
+    }
+    exec(compile(ast.Module(body=[default, *functions], type_ignores=[]), "daemon-config-test", "exec"), namespace)
+    return namespace["config"]
+
+
 class CloudflareResidencyTests(unittest.TestCase):
+    def test_live_dictation_selects_each_enabled_cloudflare_backend_and_files_stay_local(self):
+        select, _ = daemon_function("select_job_backends")
+        profile = {"cloudflare_asr_enabled": True,
+                   "cloudflare_corrector": {"enabled": True, "model": "@cf/qwen/test"}}
+        provider, corrector = select("live_dictation", profile)
+        self.assertEqual(provider, "cloudflare")
+        self.assertTrue(corrector["enabled"])
+        self.assertEqual(select("file", profile), ("local", {"enabled": False}))
+        self.assertEqual(select("youtube", profile), ("local", {"enabled": False}))
+        profile["cloudflare_asr_enabled"] = False
+        self.assertEqual(select("live_dictation", profile)[0], "local")
+
+    def test_invalid_local_profile_resets_locals_without_clearing_cloudflare_toggles(self):
+        defaults = {key: None for key in ("model", "language", "device", "compute_type", "beam_size",
+                   "best_of", "temperature", "vad", "condition_on_previous_text", "initial_prompt",
+                   "glossary", "result_mode", "fallback", "corrector")}
+        defaults.update({"model": "large-v3", "corrector": {"enabled": False}})
+        restore, _ = daemon_function("restore_local_profile_defaults",
+            clone_default=lambda: dict(defaults))
+        value = dict(defaults, model="invalid", cloudflare_asr_enabled=True,
+                     cloudflare_corrector={"enabled": True})
+        restored = restore(value)
+        self.assertEqual(restored["model"], "large-v3")
+        self.assertTrue(restored["cloudflare_asr_enabled"])
+        self.assertTrue(restored["cloudflare_corrector"]["enabled"])
+        self.assertIn("restore_local_profile_defaults(value)", SOURCE)
+
+    def test_daemon_config_keeps_enabled_cloudflare_backends_when_local_profile_is_invalid(self):
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as config_file:
+            defaults = {
+                "version": 1, "model": "large-v3", "language": "ru", "device": "cuda",
+                "compute_type": "int8_float16", "beam_size": 1, "best_of": 1,
+                "temperature": 0.0, "vad": False, "condition_on_previous_text": True,
+                "initial_prompt": "", "glossary": [], "result_mode": "clipboard",
+                "fallback": {"model": "medium", "device": "cuda", "compute_type": "int8_float16",
+                             "allow_cpu": False},
+                "cloudflare_asr_enabled": True, "cloudflare_asr_model": "@cf/openai/whisper-large-v3-turbo",
+                "cloudflare_asr": {"model": "@cf/openai/whisper-large-v3-turbo", "task": "transcribe",
+                    "language": "ru", "vad_filter": False, "beam_size": 1, "initial_prompt": "",
+                    "prefix": "", "condition_on_previous_text": True, "no_speech_threshold": 0.6,
+                    "compression_ratio_threshold": 2.4, "log_prob_threshold": -1.0,
+                    "hallucination_silence_threshold": None},
+                "cloudflare_corrector": {"enabled": True, "model": "@cf/qwen/qwen3-30b-a3b-fp8",
+                    "temperature": 0.0, "max_tokens": 2048},
+                "corrector": {"enabled": True, "provider": "ollama", "model": "qwen-local",
+                    "prompt": "", "timeout_seconds": 999, "max_length_ratio": 1.5,
+                    "num_gpu": 8, "keep_alive": "5m", "temperature": 0,
+                    "num_ctx": 8192, "num_thread": 4},
+            }
+            json.dump(defaults, config_file)
+            config_file.flush()
+            value = load_config_function(config_file.name)()
+        self.assertTrue(value["cloudflare_asr_enabled"])
+        self.assertTrue(value["cloudflare_corrector"]["enabled"])
+        self.assertEqual(value["corrector"]["timeout_seconds"], 300)
+        defaults["cloudflare_asr"]["beam_size"] = 2
+        defaults["cloudflare_corrector"]["model"] = "invalid-cloud-model"
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as config_file:
+            json.dump(defaults, config_file)
+            config_file.flush()
+            value = load_config_function(config_file.name)()
+        self.assertTrue(value["cloudflare_asr_enabled"])
+        self.assertEqual(value["cloudflare_asr"]["beam_size"], 1)
+        self.assertTrue(value["cloudflare_corrector"]["enabled"])
+        self.assertEqual(value["cloudflare_corrector"]["model"], "@cf/qwen/qwen3-30b-a3b-fp8")
+
+    def test_shell_profile_parser_preserves_cloudflare_toggle_if_local_profile_is_invalid(self):
+        wrapper = (ROOT / "scripts/whisper-dictate-v2").read_text(encoding="utf-8")
+        start = wrapper.index("<<'PY'\n") + len("<<'PY'\n")
+        end = wrapper.index("\nPY\n)", start)
+        parser = wrapper[start:end]
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as config_file:
+            json.dump({"model": "invalid-local-model", "cloudflare_asr_enabled": True}, config_file)
+            config_file.flush()
+            result = subprocess.run([sys.executable, "-", config_file.name], input=parser,
+                                    text=True, capture_output=True, check=True)
+        self.assertIn("model=large-v3", result.stdout)
+        self.assertIn("cloudflare_asr_enabled=true", result.stdout)
+
     def test_unknown_and_file_sources_fail_closed(self):
-        self.assertIn("source == \"live_dictation\" and config()[\"cloudflare_asr_enabled\"]", SOURCE)
+        select, _ = daemon_function("select_job_backends")
+        profile = {"cloudflare_asr_enabled": True,
+                   "cloudflare_corrector": {"enabled": True}}
+        self.assertEqual(select("unknown", profile), ("local", {"enabled": False}))
+
+    def test_daemon_client_forwards_job_source_to_daemon(self):
+        client = (ROOT / "scripts/whisper-daemon-client.sh").read_text(encoding="utf-8")
+        self.assertIn('DAEMON_SOURCE="${WHISPER_JOB_SOURCE:-}"', client)
+        self.assertIn('"source":os.environ["DAEMON_SOURCE"]', client)
 
     def test_delayed_whisper_release_uses_fake_clock_and_honors_new_lease(self):
         events = []
@@ -74,7 +183,7 @@ class CloudflareResidencyTests(unittest.TestCase):
         local_qwen = run.index("correct_text_sync, text, corrector")
         self.assertLess(asr_end, correction_release)
         self.assertLess(correction_release, local_qwen)
-        self.assertIn('if job.get("source") == "live_dictation" else {"enabled": False}', run)
+        self.assertIn('select_job_backends(job.get("source"), value)', run)
         self.assertIn('await prepare_remote_models(corrector["model"])', run)
         self.assertIn("delayed_qwen_release(corrector[\"model\"])", run)
 

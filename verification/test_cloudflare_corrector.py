@@ -144,8 +144,8 @@ class CloudflareCorrectorTests(unittest.TestCase):
 
     def test_cloudflare_menu_is_top_level_and_backend_indicator_marks_cloud_only(self):
         source = (ROOT / "scripts" / "whisper-tray.py").read_text(encoding="utf-8")
-        self.assertIn('menu.append(cloudflare_menu_item)', source)
-        self.assertIn('☁️ Обработка Cloudflare', source)
+        self.assertIn('menu.append(cloudflare_menu_item)\nmenu.append(whisper_settings_item)', source)
+        self.assertIn('def processing_status_label(model, stage, icon_key, icon_label=None):', source)
         daemon = (ROOT / "scripts" / "whisper-daemon.py").read_text(encoding="utf-8")
         self.assertIn('"corrector_backend":correction_backend', daemon)
         self.assertIn('"device":"cloudflare" if used_cloudflare or correction_backend == "cloudflare"', daemon)

@@ -35,10 +35,15 @@ JOBS = CACHE / "jobs"
 CACHE.mkdir(parents=True, exist_ok=True)
 DEFAULT = {"version": 1, "model": "large-v3", "language": "ru", "device": "cuda",
  "compute_type": "int8_float16", "beam_size": 1, "best_of": 1, "temperature": 0.0,
- "vad": False, "initial_prompt": "", "glossary": [], "result_mode": "clipboard",
+ "vad": False, "condition_on_previous_text": True, "initial_prompt": "", "glossary": [], "result_mode": "clipboard",
  "fallback": {"model": "medium", "device": "cuda", "compute_type": "int8_float16",
               "allow_cpu": False},
  "cloudflare_asr_enabled": False, "cloudflare_asr_model": "@cf/openai/whisper-large-v3-turbo",
+ "cloudflare_asr": {"model": "@cf/openai/whisper-large-v3-turbo", "task": "transcribe",
+                    "language": "ru", "vad_filter": False, "beam_size": 1,
+                    "initial_prompt": "", "prefix": "", "condition_on_previous_text": True,
+                    "no_speech_threshold": 0.6, "compression_ratio_threshold": 2.4,
+                    "log_prob_threshold": -1.0, "hallucination_silence_threshold": None},
  "cloudflare_corrector": {"enabled": False, "model": DEFAULT_CLOUDFLARE_CORRECTOR,
                           "temperature": 0.0, "max_tokens": 2048},
  "corrector": {"enabled": False, "provider": "ollama", "model": "qwen3.5:4b-q4_K_M", "prompt": "",
@@ -58,8 +63,25 @@ queue = asyncio.Queue()
 def clone_default():
     return json.loads(json.dumps(DEFAULT))
 
+def restore_local_profile_defaults(value):
+    """Reset an invalid local profile without discarding valid Cloudflare choices."""
+    defaults = clone_default()
+    for key in ("model", "language", "device", "compute_type", "beam_size", "best_of",
+                "temperature", "vad", "condition_on_previous_text", "initial_prompt",
+                "glossary", "result_mode", "fallback", "corrector"):
+        value[key] = defaults[key]
+    return value
+
+def select_job_backends(source, profile):
+    """Honor Cloudflare toggles for live dictation and fail closed for other sources."""
+    live = source == "live_dictation"
+    provider = "cloudflare" if live and profile.get("cloudflare_asr_enabled") is True else "local"
+    cloud_corrector = profile.get("cloudflare_corrector", {}) if live else {"enabled": False}
+    return provider, cloud_corrector
+
 def config():
     value = clone_default()
+    raw = {}
     if CONFIG.exists():
         try:
             raw = json.loads(CONFIG.read_text(encoding="utf-8"))
@@ -77,7 +99,7 @@ def config():
              2 <= len(value["language"]) <= 12 and isinstance(value["beam_size"], int) and
              1 <= value["beam_size"] <= 10 and isinstance(value["best_of"], int) and
              1 <= value["best_of"] <= 10 and isinstance(value["temperature"], (int, float)) and
-             0 <= value["temperature"] <= 1 and isinstance(value["vad"], bool) and
+             0 <= value["temperature"] <= 1 and isinstance(value["vad"], bool) and isinstance(value["condition_on_previous_text"], bool) and
              isinstance(value["initial_prompt"], str) and len(value["initial_prompt"]) <= 800 and
              isinstance(value["glossary"], list) and value["result_mode"] in {"clipboard", "autopaste"})
     fallback = value["fallback"]
@@ -85,8 +107,30 @@ def config():
     corrector = value["corrector"]
     valid = valid and isinstance(corrector, dict) and isinstance(corrector.get("enabled"), bool) and corrector.get("provider") == "ollama" and isinstance(corrector.get("model"), str) and 1 <= len(corrector["model"]) <= 160 and isinstance(corrector.get("prompt"), str) and len(corrector["prompt"]) <= 1500 and type(corrector.get("timeout_seconds")) is int and corrector["timeout_seconds"] in {5, 10, 15, 30, 60, 120, 300} and isinstance(corrector.get("max_length_ratio"), (int, float)) and 1 <= corrector["max_length_ratio"] <= 3 and type(corrector.get("num_gpu")) is int and corrector["num_gpu"] in {0, 4, 8, 12} and corrector.get("keep_alive") in {0, "30s", "5m"} and type(corrector.get("temperature")) in {int, float} and corrector["temperature"] in {0, 0.1, 0.2} and type(corrector.get("num_ctx")) is int and corrector["num_ctx"] in {1024, 2048, 4096, 8192} and type(corrector.get("num_thread")) is int and corrector["num_thread"] in {2, 4, 8}
     if not valid:
-        logger.warning("Configuration failed validation; safe defaults used")
-        return clone_default()
+        logger.warning("Local profile failed validation; local defaults used")
+        restore_local_profile_defaults(value)
+    cloud_asr = clone_default()["cloudflare_asr"]
+    raw_asr = raw.get("cloudflare_asr")
+    if isinstance(raw_asr, dict):
+        cloud_asr.update(raw_asr)
+    else:
+        cloud_asr["model"] = raw.get("cloudflare_asr_model", cloud_asr["model"])
+    valid_asr = (cloud_asr.get("model") in {"@cf/openai/whisper-large-v3-turbo", "@cf/openai/whisper"} and
+        cloud_asr.get("task") in {"transcribe", "translate"} and
+        cloud_asr.get("language") in {"", "ru", "en"} and type(cloud_asr.get("vad_filter")) is bool and
+        type(cloud_asr.get("beam_size")) is int and cloud_asr["beam_size"] in {1, 3, 5, 10} and
+        isinstance(cloud_asr.get("initial_prompt"), str) and len(cloud_asr["initial_prompt"]) <= 800 and
+        isinstance(cloud_asr.get("prefix"), str) and len(cloud_asr["prefix"]) <= 200 and
+        type(cloud_asr.get("condition_on_previous_text")) is bool and
+        type(cloud_asr.get("no_speech_threshold")) in (int, float) and 0 <= cloud_asr["no_speech_threshold"] <= 1 and
+        type(cloud_asr.get("compression_ratio_threshold")) in (int, float) and 1 <= cloud_asr["compression_ratio_threshold"] <= 5 and
+        type(cloud_asr.get("log_prob_threshold")) in (int, float) and -5 <= cloud_asr["log_prob_threshold"] <= 0 and
+        (cloud_asr.get("hallucination_silence_threshold") is None or cloud_asr["hallucination_silence_threshold"] in {2, 4, 8}))
+    if not valid_asr:
+        logger.warning("Cloudflare Whisper configuration failed validation; using safe defaults")
+        cloud_asr = clone_default()["cloudflare_asr"]
+    value["cloudflare_asr"] = cloud_asr
+    value["cloudflare_asr_model"] = cloud_asr["model"]
     cloud_corrector = value["cloudflare_corrector"]
     if not isinstance(value["cloudflare_asr_enabled"], bool):
         logger.warning("Cloudflare ASR toggle invalid; ASR remains local")
@@ -96,9 +140,11 @@ def config():
         type(cloud_corrector.get("temperature")) in (int, float) and 0 <= cloud_corrector["temperature"] <= 5 and
         type(cloud_corrector.get("max_tokens")) is int and cloud_corrector["max_tokens"] in {256, 512, 1024, 2048, 4096})
     if not valid_cloud:
-        logger.warning("Cloudflare configuration failed validation; cloud providers disabled")
-        value["cloudflare_asr_enabled"] = False
-        value["cloudflare_corrector"] = clone_default()["cloudflare_corrector"]
+        logger.warning("Cloudflare corrector configuration failed validation; safe settings used")
+        enabled = isinstance(cloud_corrector, dict) and cloud_corrector.get("enabled") is True
+        cloud_corrector = clone_default()["cloudflare_corrector"]
+        cloud_corrector["enabled"] = enabled
+        value["cloudflare_corrector"] = cloud_corrector
     value["glossary"] = [x for x in value["glossary"] if isinstance(x, str) and x.strip()][:50]
     return value
 
@@ -199,6 +245,7 @@ async def ensure(value):
 
 def transcribe_sync(wav, value):
     segments, _ = model.transcribe(wav, language=value["language"], vad_filter=value["vad"],
+        condition_on_previous_text=value["condition_on_previous_text"],
         beam_size=value["beam_size"], best_of=value["best_of"], temperature=value["temperature"],
         initial_prompt=prompt(value))
     return "".join(item.text for item in segments).strip()
@@ -317,6 +364,22 @@ def correction_is_safe(source, corrected, done_reason):
                    for candidate in corrected_tail)
     return all(tail_word_present(word) for word in tail)
 
+def ollama_loaded_device(model_name, requested_device):
+    """Read Ollama's loaded-model VRAM metadata without logging user content."""
+    request = urllib.request.Request("http://127.0.0.1:11434/api/ps", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=1.5) as response:
+            models = json.load(response).get("models", [])
+    except (OSError, ValueError, TypeError, urllib.error.URLError, TimeoutError):
+        return requested_device
+    for loaded in models:
+        if loaded.get("name") == model_name or loaded.get("model") == model_name:
+            try:
+                return "cuda" if int(loaded.get("size_vram", 0)) > 0 else "cpu"
+            except (TypeError, ValueError):
+                return requested_device
+    return requested_device
+
 def correct_text_sync(text, corrector, cloudflare_profile=None, backend_callback=None):
     """Correct safely in bounded chunks; retry once, then retain raw ASR chunk."""
     text = normalize_asr_text(text)
@@ -354,7 +417,8 @@ def correct_text_sync(text, corrector, cloudflare_profile=None, backend_callback
     else:
         cloudflare_fallback = False
         if backend_callback:
-            backend_callback("local")
+            backend_callback("local", ollama_loaded_device(
+                corrector["model"], "cuda" if int(corrector.get("num_gpu", 0) or 0) > 0 else "cpu"))
     try:
         if corrector.get("provider") != "ollama":
             raise ValueError("unsupported corrector profile")
@@ -364,6 +428,9 @@ def correct_text_sync(text, corrector, cloudflare_profile=None, backend_callback
         chunks = correction_chunks(text)
         for index, chunk in enumerate(chunks, start=1):
             corrected, done_reason = correction_response(chunk, corrector, instruction)
+            if index == 1 and backend_callback:
+                backend_callback("local", ollama_loaded_device(
+                    corrector["model"], "cuda" if int(corrector.get("num_gpu", 0) or 0) > 0 else "cpu"))
             if not correction_is_safe(chunk, corrected, done_reason):
                 logger.warning("Qwen reply rejected; retrying chunk=%d/%d done_reason=%s",
                                index, len(chunks), done_reason)
@@ -420,7 +487,7 @@ def write_metric(entry):
             stream.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
     except OSError: logger.warning("Could not write metrics")
 
-def update_job_backend(job_id, backend, profile, cloud_model=DEFAULT_CLOUDFLARE_CORRECTOR, stage="asr"):
+def update_job_backend(job_id, backend, profile, cloud_model=DEFAULT_CLOUDFLARE_CORRECTOR, stage="asr", device=None):
     """Update only a validated active job's backend; never write transcript data."""
     if not isinstance(job_id, str) or not job_id.isdigit() or len(job_id) > 32:
         return
@@ -433,6 +500,10 @@ def update_job_backend(job_id, backend, profile, cloud_model=DEFAULT_CLOUDFLARE_
         entry["backend"] = backend
         if backend == "cloudflare":
             entry.update({"device": "cloudflare", "model": cloud_model})
+        elif stage == "correction":
+            corrector = profile.get("corrector", {})
+            entry.update({"device": device or ("cuda" if int(corrector.get("num_gpu", 0) or 0) > 0 else "cpu"),
+                          "model": corrector.get("model", profile["model"])})
         else:
             entry.update({"device": profile["device"], "model": profile["model"]})
         temporary = path.with_suffix(".json.tmp")
@@ -447,11 +518,25 @@ async def run(job):
     value, wav = job["profile"], job["wav"]
     provider = job.get("provider", "local")
     cloudflare_failed = False
+    _planned_asr_provider, planned_corrector = select_job_backends(job.get("source"), value)
+    planned_asr_model = (value.get("cloudflare_asr", {}).get("model", value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo"))
+                         if provider == "cloudflare" else value.get("model"))
+    planned_corrector_backend = ("cloudflare" if planned_corrector.get("enabled") else
+                                 "local" if value.get("corrector", {}).get("enabled") else "local_disabled")
+    planned_corrector_model = (planned_corrector.get("model") if planned_corrector_backend == "cloudflare" else
+                               value.get("corrector", {}).get("model") if planned_corrector_backend == "local" else None)
+    initial_metadata = {"asr_backend": provider, "asr_model": planned_asr_model,
+                        "asr_device": "cloudflare" if provider == "cloudflare" else value.get("device"),
+                        "corrector_backend": planned_corrector_backend,
+                        "corrector_model": planned_corrector_model,
+                        "corrector_device": "cloudflare" if planned_corrector_backend == "cloudflare" else
+                                           ("cuda" if int(value.get("corrector", {}).get("num_gpu", 0) or 0) > 0 else "cpu")
+                                           if planned_corrector_backend == "local" else None}
     if not os.path.isfile(wav):
-        return {"status":"error","message":"Audio file not found","error_code":"audio_not_found"}
+        return {"status":"error","message":"Audio file not found","error_code":"audio_not_found", **initial_metadata}
+    selected_cf_asr = value.get("cloudflare_asr", {}).get("model", value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo"))
     update_job_backend(job.get("job_id"), "cloudflare" if provider == "cloudflare" else "local", value,
-                       "@cf/openai/whisper-large-v3-turbo" if provider == "cloudflare"
-                       else value["cloudflare_corrector"]["model"])
+                       selected_cf_asr if provider == "cloudflare" else value["cloudflare_corrector"]["model"])
     cold = False; fallback = None
     try:
         t0 = time.monotonic()
@@ -466,7 +551,12 @@ async def run(job):
                 return await asyncio.to_thread(transcribe_sync, wav, value)
 
             text, cloudflare_failed, cloudflare_error = await cloudflare_first(
-                lambda: asyncio.to_thread(cloudflare_transcribe, wav, "ru", value["vad"], prompt(value) or "", value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo")),
+                lambda: asyncio.to_thread(cloudflare_transcribe, wav,
+                    value["cloudflare_asr"].get("language", "ru"),
+                    value["cloudflare_asr"].get("vad_filter", False),
+                    value["cloudflare_asr"].get("initial_prompt", ""),
+                    value["cloudflare_asr"].get("model", value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo")),
+                    value["cloudflare_asr"]),
                 local_transcribe, True)
             if not cloudflare_failed:
                 asyncio.create_task(delayed_whisper_release())
@@ -477,12 +567,18 @@ async def run(job):
             cold = await prepare_local_asr(value)
             text = await asyncio.to_thread(transcribe_sync, wav, value)
         elapsed = time.monotonic() - t0
+        used_cloudflare = provider == "cloudflare" and not cloudflare_failed
+        asr_model_name = (value["cloudflare_asr"].get("model", value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo"))
+                          if used_cloudflare else value["model"])
+        asr_backend = "cloudflare" if used_cloudflare else "local"
+        asr_device = "cloudflare" if used_cloudflare else value["device"]
         if not text:
             return {"status":"error","message":"Empty transcription","error_code":"empty_transcription",
-                    **{k:value[k] for k in ("model","device","compute_type")}}
+                    **{k:value[k] for k in ("model","device","compute_type")},
+                    "asr_backend":asr_backend,"asr_model":asr_model_name,"asr_device":asr_device,
+                    "corrector_backend":"not_run"}
         corrector, large_cpu_corrector = large_corrector_profile(value)
-        cloud_corrector = (value["cloudflare_corrector"]
-                           if job.get("source") == "live_dictation" else {"enabled": False})
+        _correction_provider, cloud_corrector = select_job_backends(job.get("source"), value)
         if cloud_corrector.get("enabled"):
             # Remote correction is live-dictation-only and runs after both
             # local Whisper and Ollama have been released.
@@ -498,37 +594,51 @@ async def run(job):
                 await release()
         if large_cpu_corrector:
             await asyncio.to_thread(unload_corrector_model, corrector["model"])
+        correction_device = "cuda" if int(corrector.get("num_gpu", 0) or 0) > 0 else "cpu"
+        correction_status = {"device": None}
+        def report_correction_backend(backend, actual_device=None):
+            correction_status["device"] = ("cloudflare" if backend == "cloudflare"
+                                            else actual_device or correction_device)
+            model_name = (value["cloudflare_corrector"]["model"] if backend == "cloudflare"
+                          else corrector["model"])
+            update_job_backend(job.get("job_id"), backend, value, model_name,
+                               stage="correction", device=correction_status["device"])
         text, correction_fallback, correction_seconds, correction_backend, correction_usage = await asyncio.to_thread(
             correct_text_sync, text, corrector, cloud_corrector,
-            lambda backend: update_job_backend(job.get("job_id"), backend, value,
-                                               value["cloudflare_corrector"]["model"], stage="correction"))
+            report_correction_backend)
         if correction_backend == "cloudflare":
             asyncio.create_task(delayed_whisper_release())
             asyncio.create_task(delayed_qwen_release(corrector["model"]))
         if correction_backend in {"local", "local_fallback"} and (
                 corrector.get("enabled") or correction_backend == "local_fallback"):
             await asyncio.to_thread(release_qwen_under_memory_pressure, corrector)
-        used_cloudflare = provider == "cloudflare" and not cloudflare_failed
-        model_name = value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo") if used_cloudflare else value["model"]
+        model_name = asr_model_name
+        corrector_model_name = (None if correction_backend == "local_disabled" else
+                                value["cloudflare_corrector"]["model"] if correction_backend == "cloudflare"
+                                else corrector["model"])
+        corrector_device = (None if correction_backend == "local_disabled" else
+                            correction_status["device"] or correction_device)
         correction_mode = "cpu_for_large" if large_cpu_corrector and correction_backend in {"local", "local_fallback"} else "configured"
         return {"status":"ok","text":text,"cold_start":cold,"asr_seconds":round(elapsed,3), "correction_fallback": correction_fallback, "correction_seconds": correction_seconds, "correction_mode": correction_mode,
                 "fallback":fallback,"model":model_name,"device":"cloudflare" if used_cloudflare or correction_backend == "cloudflare" else value["device"],"compute_type":"remote" if used_cloudflare or correction_backend == "cloudflare" else value["compute_type"],
-                "asr_backend":"cloudflare" if used_cloudflare else "local",
-                "corrector_backend":correction_backend,"corrector_usage":correction_usage}
+                "asr_backend":asr_backend,"asr_model":asr_model_name,"asr_device":asr_device,
+                "corrector_backend":correction_backend,"corrector_model":corrector_model_name,
+                "corrector_device":corrector_device,"corrector_usage":correction_usage}
     except CloudflareError as error:
         return {"status":"error","message":str(error),"error_code":"cloudflare_asr_failed","error_category":getattr(error, "category", "invalid_response"),
-                "model":value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo"),"device":"cloudflare","compute_type":"remote"}
+                "model":planned_asr_model,"device":"cloudflare","compute_type":"remote", **initial_metadata}
     except Exception as error:
         if not is_oom(error):
             logger.error("ASR failed model=%s device=%s", value["model"], value["device"])
             return {"status":"error","message":"ASR failed; see local daemon log","error_code":"asr_failed",
-                    **{k:value[k] for k in ("model","device","compute_type")}}
+                    **{k:value[k] for k in ("model","device","compute_type")}, **initial_metadata}
         logger.warning("OOM model=%s device=%s; applying configured fallback once", value["model"], value["device"])
         await release(); fb = dict(value["fallback"])
         if fb["device"] == "cpu" and not fb["allow_cpu"]:
             return {"status":"error","message":"CUDA memory exhausted; CPU fallback is disabled",
-                    "error_code":"oom_cpu_fallback_disabled",**{k:value[k] for k in ("model","device","compute_type")}}
+                    "error_code":"oom_cpu_fallback_disabled",**{k:value[k] for k in ("model","device","compute_type")}, **initial_metadata}
         retry = dict(value); retry.update(fb)
+        update_job_backend(job.get("job_id"), "local", retry, stage="asr")
         fallback = f'{fb["model"]}:{fb["device"]}:{fb["compute_type"]}'
         try:
             cold = await ensure(retry); t0 = time.monotonic()
@@ -536,12 +646,15 @@ async def run(job):
             elapsed = time.monotonic() - t0
             if text:
                 return {"status":"ok","text":text,"cold_start":cold,"asr_seconds":round(elapsed,3),
-                        "fallback":fallback,**{k:retry[k] for k in ("model","device","compute_type")}}
+                        "fallback":fallback,**{k:retry[k] for k in ("model","device","compute_type")},
+                        "asr_backend":"local","asr_model":retry["model"],"asr_device":retry["device"],
+                        "corrector_backend":"not_run","corrector_model":None,"corrector_device":None}
         except Exception: pass
         logger.error("Configured OOM fallback failed model=%s device=%s", retry["model"], retry["device"])
         return {"status":"error","message":"ASR fallback failed; see local daemon log",
-                "error_code":"fallback_failed","fallback":fallback,
-                **{k:retry[k] for k in ("model","device","compute_type")}}
+                "error_code":"fallback_failed","fallback":fallback, **initial_metadata,
+                **{k:retry[k] for k in ("model","device","compute_type")},
+                "asr_backend":"local","asr_model":retry["model"],"asr_device":retry["device"]}
 
 async def worker():
     while True:
@@ -550,9 +663,14 @@ async def worker():
             result = await run(job)
             if not job["future"].cancelled(): job["future"].set_result(result)
             write_metric({"timestamp":datetime.now(timezone.utc).isoformat(),
+                "source":job.get("source", "local_job"),
                 "config_version":job["profile"]["version"],"model":result.get("model",job["profile"]["model"]),
                 "device":result.get("device",job["profile"]["device"]),
                 "compute_type":result.get("compute_type",job["profile"]["compute_type"]),
+                "asr_model":result.get("asr_model", result.get("model", job["profile"]["model"])),
+                "asr_device":result.get("asr_device", result.get("device", job["profile"]["device"])),
+                "corrector_model":result.get("corrector_model"),
+                "corrector_device":result.get("corrector_device"),
                 "audio_duration_seconds":duration(job["wav"]),"cold_start":result.get("cold_start"),
                 "asr_seconds":result.get("asr_seconds"),"correction_seconds":result.get("correction_seconds"), "correction_fallback":result.get("correction_fallback"), "correction_mode":result.get("correction_mode"), "total_seconds":round(time.monotonic()-started,3),
                 "queue_wait_seconds":round(started-job["queued"],3),"fallback":result.get("fallback"),
@@ -578,18 +696,19 @@ async def client(reader, writer):
         except (UnicodeDecodeError, json.JSONDecodeError): return await respond(writer, {"status":"error","message":"Invalid JSON","error_code":"invalid_json"})
         if not isinstance(req, dict) or not isinstance(req.get("wav"), str):
             return await respond(writer, {"status":"error","message":"Missing audio file","error_code":"invalid_request"})
-        try: profile = request_profile(req, config())
+        base_profile = config()
+        try: profile = request_profile(req, base_profile)
         except ValueError: return await respond(writer, {"status":"error","message":"Invalid recognition profile","error_code":"invalid_profile"})
         source = req.get("source")
         # Cloudflare is permitted only for an explicitly tagged live dictation.
-        provider = "cloudflare" if source == "live_dictation" and config()["cloudflare_asr_enabled"] else "local"
+        provider, _cloud_corrector = select_job_backends(source, base_profile)
         cloudflare_fallback_local = req.get("cloudflare_fallback_local") is True
         future = asyncio.get_running_loop().create_future()
         job_id = req.get("job_id", "")
         if not isinstance(job_id, str) or (job_id and (not job_id.isdigit() or len(job_id) > 32)):
             job_id = ""
         await queue.put({"wav":req["wav"],"profile":profile,"provider":provider,"source":source if source == "live_dictation" else "local_job","job_id":job_id,
-                         "cloudflare_fallback_local":cloudflare_fallback_local,"source":source if source == "live_dictation" else "local_job",
+                         "cloudflare_fallback_local":cloudflare_fallback_local,
                          "future":future,"queued":time.monotonic()})
         await respond(writer, await future)
     except (BrokenPipeError, ConnectionResetError, asyncio.IncompleteReadError): logger.debug("Client disconnected")

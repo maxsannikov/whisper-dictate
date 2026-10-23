@@ -447,19 +447,107 @@ def save_voice_config(value):
         log_debug(f"Ошибка сохранения voice config: {e}")
 
 # Использовать готовые иконки из системы
+APP_ICON_PATH = os.path.expanduser("~/.local/share/pixmaps/whisper-dictate.png")
 ICONS = {
-    "idle": "microphone-sensitivity-high-symbolic",  # Микрофон с волнами
+    "idle": APP_ICON_PATH if os.path.isfile(APP_ICON_PATH) else "microphone-sensitivity-high-symbolic",
     "recording": "/usr/share/icons/Papirus/24x24/actions/media-record.svg",  # КРАСНЫЙ кружочек
     "processing_cloudflare": "/usr/share/icons/Papirus/24x24/actions/cloud-download.svg",
     "processing_gpu": "/usr/share/icons/Papirus/24x24/devices/input-gaming.svg",
     "processing_cpu": "/usr/share/icons/Papirus/24x24/devices/cpu.svg"
 }
 
-DEVICE_EMOJI = {"cuda": "🎮", "cpu": "🔥", "cloudflare": "☁️", "unknown": "❔"}
-STATE_EMOJI = {"recording": "🔴", "processing": "⏰"}
+BACKEND_STATUS = {
+    "recording": ("recording", "🔴"),
+    "cloudflare": ("processing_cloudflare", "☁️"),
+    "cuda": ("processing_gpu", "🎮"),
+    "cpu": ("processing_cpu", "🔥"),
+}
+
+def backend_status_icon(state, backend, device="cpu"):
+    """Return one shared status icon key/label for menu rows and tray state."""
+    if state == "recording":
+        return BACKEND_STATUS["recording"]
+    if backend == "cloudflare" or device == "cloudflare":
+        return BACKEND_STATUS["cloudflare"]
+    local_device = backend if backend in {"cuda", "cpu"} else device
+    return BACKEND_STATUS.get(local_device, BACKEND_STATUS["cpu"])
+
+def processing_status_label(model, stage, icon_key, icon_label=None):
+    """Describe the active model, pipeline stage, and actual backend for UI status."""
+    stage_label = {"asr": "распознавание", "transcription": "распознавание",
+                   "correction": "коррекция"}.get(stage, "обработка")
+    backend_label = {"processing_cloudflare": "Cloudflare",
+                     "processing_gpu": "локальный GPU",
+                     "processing_cpu": "локальный CPU"}.get(icon_key, "локальный CPU")
+    if icon_label is None:
+        icon_label = {"processing_cloudflare": "☁️", "processing_gpu": "🎮",
+                      "processing_cpu": "🔥"}.get(icon_key, "🔥")
+    model_label = str(model or "?")[:120]
+    return f"{icon_label} {model_label} — {stage_label} · {backend_label}"
+
+def format_completed_backend_status(record):
+    """Summarize the last task's ASR and correction backends without transcript data."""
+    if not isinstance(record, dict) or not record:
+        return "Последняя задача: завершённых задач пока нет"
+
+    def describe(prefix, title):
+        backend = record.get(f"{prefix}_backend")
+        model = record.get(f"{prefix}_model")
+        device = record.get(f"{prefix}_device")
+        if backend == "local_disabled":
+            return f"{title}: отключён"
+        if backend == "not_run":
+            return f"{title}: не запускался"
+        if backend == "cloudflare" or device == "cloudflare":
+            location = "☁️ Cloudflare"
+        elif backend in {"local", "local_fallback"} and device == "cuda":
+            location = "🎮 локальный GPU"
+        elif backend in {"local", "local_fallback"} and device == "cpu":
+            location = "🔥 локальный CPU"
+        elif backend in {"local", "local_fallback"}:
+            location = "локально; устройство не записано"
+        else:
+            location = "backend не определён"
+        model_label = f"{str(model)[:48]} — " if model else ""
+        return f"{title}: {model_label}{location}"
+
+    title = "Последняя задача (ошибка)" if record.get("error_code") else "Последняя задача"
+    parts = [describe("asr", "Whisper"), describe("corrector", "Корректор")]
+    if record.get("fallback") == "cloudflare_to_local":
+        parts.append("fallback Cloudflare → local")
+    elif record.get("fallback"):
+        parts.append(f"fallback: {str(record['fallback'])[:48]}")
+    if record.get("corrector_backend") == "local_fallback":
+        parts.append("fallback корректора на local")
+    return f"{title}: " + "; ".join(parts)
+
+_last_backend_metrics_mtime = None
+def refresh_last_task_backend_status(*_args):
+    """Refresh menu item from safe backend/model/device fields in metrics.jsonl."""
+    global _last_backend_metrics_mtime
+    try:
+        mtime = os.stat(METRICS_FILE).st_mtime_ns
+        if mtime == _last_backend_metrics_mtime:
+            return True
+        latest = None
+        with open(METRICS_FILE, encoding="utf-8") as source:
+            for line in source:
+                if line.strip():
+                    latest = line
+        record = json.loads(latest) if latest else {}
+        allowed = ("asr_backend", "asr_model", "asr_device", "corrector_backend",
+                   "corrector_model", "corrector_device", "fallback", "error_code")
+        safe_record = {key: record[key] for key in allowed if key in record}
+        last_task_status_item.set_label(format_completed_backend_status(safe_record))
+        last_task_status_item.set_tooltip_text(format_completed_backend_status(safe_record))
+        _last_backend_metrics_mtime = mtime
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return True
+
 BATCH_STATUS_LABELS = {
     "queued": "⏳ Ожидание",
-    "processing": "⚙️ Обработка",
+    "processing": "Обработка",
     "completed": "✅ Готово",
     "failed": "❌ Ошибка",
     "cancelled": "🚫 Отменено"
@@ -1286,6 +1374,7 @@ def poll_batch_jobs():
 def build_batch_display_entries():
     """Собрать записи активных batch jobs для отображения в меню трея"""
     entries = []
+    local_device = load_voice_config().get("device", "cpu")
     for path in sorted(glob.glob(os.path.join(BATCH_JOBS_DIR, "*.json"))):
         try:
             with open(path, encoding="utf-8") as f:
@@ -1297,8 +1386,10 @@ def build_batch_display_entries():
         files = job.get("files", [])
         total = len(files)
         done = sum(1 for f in files if f.get("state") in ("completed", "failed"))
-        label = f"📦 BATCH: {job.get('id','?')} ({done}/{total} файлов) ⏰"
-        entries.append({"state": "processing", "device": "cuda", "label": label, "batch_id": job.get("id")})
+        icon_key, icon_label = backend_status_icon("processing", "local", local_device)
+        label = f"{icon_label} BATCH: {job.get('id','?')} ({done}/{total} файлов)"
+        entries.append({"state": "processing", "device": local_device, "backend": "local",
+                        "status_icon": icon_key, "label": label, "batch_id": job.get("id")})
     return entries
 
 def cancel_batch_job(batch_id):
@@ -3244,6 +3335,10 @@ cleanup_tasks_item = Gtk.MenuItem(label="🧹 Очистить зависшие 
 cleanup_tasks_item.connect("activate", on_cleanup_tasks_clicked)
 menu.append(cleanup_tasks_item)
 
+last_task_status_item = Gtk.MenuItem(label=format_completed_backend_status({}))
+last_task_status_item.set_sensitive(False)
+menu.append(last_task_status_item)
+
 menu.append(Gtk.SeparatorMenuItem())
 
 whisper_settings_submenu = Gtk.Menu()
@@ -3277,10 +3372,11 @@ def on_cloudflare_toggled(item):
         log_debug("Локальный ASR выбран для диктовки")
 
 cloudflare_submenu = Gtk.Menu()
-cloudflare_asr_toggle = Gtk.CheckMenuItem(label="Использовать Cloudflare для ASR Whisper")
+cloudflare_asr_toggle = Gtk.CheckMenuItem(label="Использовать Cloudflare для Whisper")
 cloudflare_asr_toggle.set_active(bool(load_voice_config().get("cloudflare_asr_enabled", load_voice_config().get("cloudflare_workers_ai_enabled", False))))
 cloudflare_asr_toggle.connect("toggled", on_cloudflare_toggled)
 cloudflare_submenu.append(cloudflare_asr_toggle)
+
 cloudflare_corrector_toggle = Gtk.CheckMenuItem(label="Использовать Cloudflare для корректора")
 cloudflare_corrector_toggle.set_active(bool(load_voice_config().get("cloudflare_corrector", {}).get("enabled", False)))
 def on_cloudflare_corrector_toggled(item):
@@ -3292,59 +3388,12 @@ def on_cloudflare_corrector_toggled(item):
     save_voice_config(value)
 cloudflare_corrector_toggle.connect("toggled", on_cloudflare_corrector_toggled)
 cloudflare_submenu.append(cloudflare_corrector_toggle)
-cloudflare_submenu.append(Gtk.SeparatorMenuItem())
-cloudflare_model_group = []
-cloudflare_asr_model_group = []
-cloudflare_asr_models = [("@cf/openai/whisper-large-v3-turbo", "Whisper Large-v3 Turbo (по умолчанию)"), ("@cf/openai/whisper", "Whisper Large-v3")]
-for model_name, model_label in cloudflare_asr_models:
-    model_item = Gtk.RadioMenuItem(label=model_label) if not cloudflare_asr_model_group else Gtk.RadioMenuItem.new_from_widget(cloudflare_asr_model_group[0])
-    model_item.set_label("ASR: " + model_label)
-    model_item.set_active(load_voice_config().get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo") == model_name)
-    def select_cloudflare_asr_model(menu_item, selected_model):
-        if menu_item.get_active():
-            value = load_voice_config(); value["cloudflare_asr_model"] = selected_model; save_voice_config(value)
-    model_item.connect("toggled", select_cloudflare_asr_model, model_name)
-    cloudflare_asr_model_group.append(model_item); cloudflare_submenu.append(model_item)
-cloudflare_submenu.append(Gtk.SeparatorMenuItem())
-cloudflare_models = [("@cf/qwen/qwen3-30b-a3b-fp8", "Qwen3 30B A3B FP8 (по умолчанию)"),
-                    ("@cf/zai-org/glm-4.7-flash", "GLM 4.7 Flash")]
-for model_name, model_label in cloudflare_models:
-    model_item = Gtk.RadioMenuItem(label=model_label) if not cloudflare_model_group else Gtk.RadioMenuItem.new_from_widget(cloudflare_model_group[0])
-    model_item.set_label(model_label)
-    model_item.set_active(load_voice_config().get("cloudflare_corrector", {}).get("model", "@cf/qwen/qwen3-30b-a3b-fp8") == model_name)
-    def select_cloudflare_model(menu_item, selected_model):
-        if menu_item.get_active():
-            value = load_voice_config()
-            profile = value.get("cloudflare_corrector", {})
-            profile["model"] = selected_model
-            value["cloudflare_corrector"] = profile
-            save_voice_config(value)
-    model_item.connect("toggled", select_cloudflare_model, model_name)
-    cloudflare_model_group.append(model_item)
-    cloudflare_submenu.append(model_item)
-cloudflare_submenu.append(Gtk.SeparatorMenuItem())
-def set_cloudflare_parameter(item, key, val):
-    if item.get_active():
-        value = load_voice_config()
-        profile = value.get("cloudflare_corrector", {})
-        profile[key] = val
-        value["cloudflare_corrector"] = profile
-        save_voice_config(value)
-for key, options in [("temperature", [(0.0, "Температура 0"), (0.2, "Температура 0.2"), (0.6, "Температура 0.6")]),
-                    ("max_tokens", [(512, "Ответ до 512 токенов"), (1024, "Ответ до 1024 токенов"), (2048, "Ответ до 2048 токенов"), (4096, "Ответ до 4096 токенов")])]:
-    group = []
-    for val, label in options:
-        option = Gtk.RadioMenuItem(label=label) if not group else Gtk.RadioMenuItem.new_from_widget(group[0])
-        option.set_label(label)
-        option.set_active(load_voice_config().get("cloudflare_corrector", {}).get(key, 0.0 if key == "temperature" else 2048) == val)
-        option.connect("toggled", set_cloudflare_parameter, key, val)
-        group.append(option)
-        cloudflare_submenu.append(option)
-cloudflare_submenu.append(Gtk.SeparatorMenuItem())
+
 cloudflare_status = Gtk.MenuItem()
 cloudflare_status.set_sensitive(False)
 cloudflare_status.set_label("✅ Учётные данные доступны" if cloudflare_credentials_available()
                             else "❌ Нет файла или обязательных переменных")
+cloudflare_submenu.append(Gtk.SeparatorMenuItem())
 cloudflare_submenu.append(cloudflare_status)
 cloudflare_usage = Gtk.MenuItem()
 cloudflare_usage.set_sensitive(False)
@@ -3363,11 +3412,178 @@ def refresh_cloudflare_usage(*_args):
 refresh_cloudflare_usage()
 cloudflare_submenu.connect("show", refresh_cloudflare_usage)
 cloudflare_submenu.append(cloudflare_usage)
+cloudflare_submenu.append(Gtk.SeparatorMenuItem())
+
+def set_cloudflare_asr_value(item, key, selected, is_toggle=False):
+    if is_toggle:
+        active, value = True, item.get_active()
+    else:
+        active, value = item.get_active(), selected
+    if not active:
+        return
+    config = load_voice_config()
+    profile = config.get("cloudflare_asr", {})
+    if not isinstance(profile, dict):
+        profile = {}
+    if key == "model":
+        config["cloudflare_asr_model"] = value
+    profile[key] = value
+    config["cloudflare_asr"] = profile
+    save_voice_config(config)
+
+def cloudflare_asr_profile():
+    profile = load_voice_config().get("cloudflare_asr", {})
+    return profile if isinstance(profile, dict) else {}
+
+def edit_cloudflare_asr_text(_item, key, title, limit):
+    config = load_voice_config()
+    profile = config.get("cloudflare_asr", {})
+    if not isinstance(profile, dict):
+        profile = {}
+    dialog = Gtk.Dialog(title=title, transient_for=None, flags=0,
+                        buttons=("Отмена", Gtk.ResponseType.CANCEL, "Сохранить", Gtk.ResponseType.OK))
+    dialog.set_default_size(460, 120)
+    entry = Gtk.Entry()
+    entry.set_max_length(limit)
+    entry.set_text(profile.get(key, ""))
+    entry.set_activates_default(True)
+    dialog.set_default_response(Gtk.ResponseType.OK)
+    dialog.get_content_area().pack_start(entry, True, True, 12)
+    entry.show()
+    if dialog.run() == Gtk.ResponseType.OK:
+        profile[key] = entry.get_text().strip()
+        config["cloudflare_asr"] = profile
+        save_voice_config(config)
+    dialog.destroy()
+
+cloudflare_whisper_settings = Gtk.Menu()
+cloudflare_turbo_only_items = []
+cloudflare_whisper_settings.append(Gtk.MenuItem(label="Модель Whisper"))
+cloudflare_whisper_settings.get_children()[-1].set_sensitive(False)
+cloudflare_asr_model_group = []
+cloudflare_asr_models = [("@cf/openai/whisper-large-v3-turbo", "Whisper Large-v3 Turbo (по умолчанию)"),
+                         ("@cf/openai/whisper", "Whisper Large-v3")]
+for model_name, model_label in cloudflare_asr_models:
+    item = Gtk.RadioMenuItem(label=model_label) if not cloudflare_asr_model_group else Gtk.RadioMenuItem.new_from_widget(cloudflare_asr_model_group[0])
+    item.set_label(model_label)
+    current_asr_model = cloudflare_asr_profile().get("model", load_voice_config().get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo"))
+    item.set_active(current_asr_model == model_name)
+    item.connect("toggled", set_cloudflare_asr_value, "model", model_name)
+    cloudflare_asr_model_group.append(item)
+    cloudflare_whisper_settings.append(item)
+cloudflare_whisper_settings.append(Gtk.SeparatorMenuItem())
+cloudflare_whisper_settings.append(Gtk.MenuItem(label="Параметры распознавания"))
+cloudflare_whisper_settings.get_children()[-1].set_sensitive(False)
+cloudflare_whisper_settings.append(Gtk.MenuItem(label="Beam size и пороги доступны для Large-v3 Turbo"))
+cloudflare_whisper_settings.get_children()[-1].set_sensitive(False)
+
+def add_cloudflare_asr_radio(title, key, options, default):
+    cloudflare_whisper_settings.append(Gtk.SeparatorMenuItem())
+    header = Gtk.MenuItem(label=title)
+    header.set_sensitive(False)
+    cloudflare_whisper_settings.append(header)
+    group = []
+    current = cloudflare_asr_profile().get(key, default)
+    for selected, label in options:
+        item = Gtk.RadioMenuItem(label=label) if not group else Gtk.RadioMenuItem.new_from_widget(group[0])
+        item.set_label(label)
+        item.set_active(current == selected)
+        item.connect("toggled", set_cloudflare_asr_value, key, selected)
+        group.append(item)
+        cloudflare_whisper_settings.append(item)
+        if key not in {"task", "language"}:
+            cloudflare_turbo_only_items.append(item)
+
+add_cloudflare_asr_radio("Задача", "task", [("transcribe", "Распознавание"), ("translate", "Перевод на английский")], "transcribe")
+add_cloudflare_asr_radio("Язык", "language", [("", "Автоопределение"), ("ru", "Русский"), ("en", "Английский")], "ru")
+cloudflare_whisper_settings.append(Gtk.SeparatorMenuItem())
+cloudflare_asr_vad_item = Gtk.CheckMenuItem(label="VAD-фильтр речи")
+cloudflare_asr_vad_item.set_active(cloudflare_asr_profile().get("vad_filter", False))
+cloudflare_asr_vad_item.connect("toggled", set_cloudflare_asr_value, "vad_filter", None, True)
+cloudflare_whisper_settings.append(cloudflare_asr_vad_item)
+add_cloudflare_asr_radio("Beam size", "beam_size", [(1, "1 — быстрее"), (3, "3"), (5, "5 — точнее"), (10, "10 — медленнее")], 1)
+cloudflare_whisper_settings.append(Gtk.SeparatorMenuItem())
+cloudflare_asr_condition_item = Gtk.CheckMenuItem(label="Учитывать предыдущий текст")
+cloudflare_asr_condition_item.set_active(cloudflare_asr_profile().get("condition_on_previous_text", True))
+cloudflare_asr_condition_item.connect("toggled", set_cloudflare_asr_value, "condition_on_previous_text", None, True)
+cloudflare_whisper_settings.append(cloudflare_asr_condition_item)
+cloudflare_turbo_only_items.append(cloudflare_asr_condition_item)
+add_cloudflare_asr_radio("Порог тишины", "no_speech_threshold", [(0.3, "0.3"), (0.6, "0.6 — по умолчанию"), (0.8, "0.8")], 0.6)
+add_cloudflare_asr_radio("Порог повторов", "compression_ratio_threshold", [(1.8, "1.8"), (2.4, "2.4 — по умолчанию"), (3.0, "3.0")], 2.4)
+add_cloudflare_asr_radio("Порог вероятности", "log_prob_threshold", [(-1.5, "-1.5"), (-1.0, "-1.0 — по умолчанию"), (-0.5, "-0.5")], -1.0)
+add_cloudflare_asr_radio("Пропуск длинной тишины", "hallucination_silence_threshold", [(None, "Выключено"), (2, "2 секунды"), (4, "4 секунды"), (8, "8 секунд")], None)
+cloudflare_whisper_settings.append(Gtk.SeparatorMenuItem())
+cloudflare_initial_prompt_item = Gtk.MenuItem(label="Изменить начальный prompt…")
+cloudflare_initial_prompt_item.connect("activate", edit_cloudflare_asr_text, "initial_prompt", "Начальный prompt Cloudflare Whisper", 800)
+cloudflare_whisper_settings.append(cloudflare_initial_prompt_item)
+cloudflare_turbo_only_items.append(cloudflare_initial_prompt_item)
+cloudflare_whisper_settings.append(Gtk.SeparatorMenuItem())
+cloudflare_prefix_item = Gtk.MenuItem(label="Изменить prefix…")
+cloudflare_prefix_item.connect("activate", edit_cloudflare_asr_text, "prefix", "Prefix Cloudflare Whisper", 200)
+cloudflare_whisper_settings.append(cloudflare_prefix_item)
+cloudflare_turbo_only_items.append(cloudflare_prefix_item)
+def refresh_cloudflare_asr_option_sensitivity(*_args):
+    enabled = cloudflare_asr_profile().get("model", load_voice_config().get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo")) == "@cf/openai/whisper-large-v3-turbo"
+    for option in cloudflare_turbo_only_items:
+        option.set_sensitive(enabled)
+cloudflare_whisper_settings.connect("show", refresh_cloudflare_asr_option_sensitivity)
+cloudflare_whisper_settings.show_all()
+cloudflare_whisper_settings_item = Gtk.MenuItem(label="🎙️ Whisper: модель и расширенные настройки")
+cloudflare_whisper_settings_item.set_submenu(cloudflare_whisper_settings)
+cloudflare_submenu.append(cloudflare_whisper_settings_item)
+
+cloudflare_qwen_settings = Gtk.Menu()
+cloudflare_qwen_settings.append(Gtk.MenuItem(label="Модель корректора Qwen"))
+cloudflare_qwen_settings.get_children()[-1].set_sensitive(False)
+cloudflare_corrector_model_group = []
+cloudflare_models = [("@cf/qwen/qwen3-30b-a3b-fp8", "Qwen3 30B A3B FP8 (по умолчанию)"),
+                    ("@cf/zai-org/glm-4.7-flash", "GLM 4.7 Flash")]
+for model_name, model_label in cloudflare_models:
+    item = Gtk.RadioMenuItem(label=model_label) if not cloudflare_corrector_model_group else Gtk.RadioMenuItem.new_from_widget(cloudflare_corrector_model_group[0])
+    item.set_label(model_label)
+    item.set_active(load_voice_config().get("cloudflare_corrector", {}).get("model", "@cf/qwen/qwen3-30b-a3b-fp8") == model_name)
+    def select_cloudflare_model(menu_item, selected_model):
+        if menu_item.get_active():
+            value = load_voice_config()
+            profile = value.get("cloudflare_corrector", {})
+            profile["model"] = selected_model
+            value["cloudflare_corrector"] = profile
+            save_voice_config(value)
+    item.connect("toggled", select_cloudflare_model, model_name)
+    cloudflare_corrector_model_group.append(item)
+    cloudflare_qwen_settings.append(item)
+cloudflare_qwen_settings.append(Gtk.SeparatorMenuItem())
+cloudflare_qwen_settings.append(Gtk.MenuItem(label="Параметры корректора"))
+cloudflare_qwen_settings.get_children()[-1].set_sensitive(False)
+def set_cloudflare_parameter(item, key, val):
+    if item.get_active():
+        value = load_voice_config()
+        profile = value.get("cloudflare_corrector", {})
+        profile[key] = val
+        value["cloudflare_corrector"] = profile
+        save_voice_config(value)
+for key, title, options in [("temperature", "Температура", [(0.0, "0 (по умолчанию)"), (0.2, "0.2"), (0.6, "0.6")]),
+                           ("max_tokens", "Максимум токенов", [(512, "512"), (1024, "1024"), (2048, "2048 (по умолчанию)"), (4096, "4096")])]:
+    cloudflare_qwen_settings.append(Gtk.SeparatorMenuItem())
+    header = Gtk.MenuItem(label=title)
+    header.set_sensitive(False)
+    cloudflare_qwen_settings.append(header)
+    group = []
+    for val, label in options:
+        item = Gtk.RadioMenuItem(label=label) if not group else Gtk.RadioMenuItem.new_from_widget(group[0])
+        item.set_label(label)
+        item.set_active(load_voice_config().get("cloudflare_corrector", {}).get(key, 0.0 if key == "temperature" else 2048) == val)
+        item.connect("toggled", set_cloudflare_parameter, key, val)
+        group.append(item)
+        cloudflare_qwen_settings.append(item)
+cloudflare_qwen_settings.show_all()
+cloudflare_qwen_settings_item = Gtk.MenuItem(label="🧠 Qwen: модель и настройки корректора")
+cloudflare_qwen_settings_item.set_submenu(cloudflare_qwen_settings)
+cloudflare_submenu.append(cloudflare_qwen_settings_item)
+
 cloudflare_submenu.show_all()
-cloudflare_menu_item = Gtk.MenuItem(label="☁️ Cloudflare Workers AI")
+cloudflare_menu_item = Gtk.MenuItem(label="☁️ Cloudflare")
 cloudflare_menu_item.set_submenu(cloudflare_submenu)
-menu.append(cloudflare_menu_item)
-menu.append(Gtk.SeparatorMenuItem())
 
 job_slot_items = []
 job_slot_batch_ids = [None] * MAX_JOB_SLOTS
@@ -3525,9 +3741,9 @@ def update_corrector_label():
     model = corrector.get("model", "Qwen [не выбран]")
     state = "вкл" if corrector.get("enabled", False) else "выкл"
     short_model = "4B" if ":4b-" in model else "2B" if ":2b-" in model else model
-    corrector_menu_item.set_label(f"✍️ Корректор: {state} · {short_model}")
+    corrector_menu_item.set_label(f"✍️ Корректор локальный: {state} · {short_model}")
     if 'corrector_enabled_item' in globals():
-        corrector_enabled_item.set_label("Включить после ASR (локально)")
+        corrector_enabled_item.set_label("Включить локальный корректор (приоритетный)")
 
 def update_corrector_vram_item():
     """Показать текущее VRAM непосредственно рядом с выбором Qwen-ускорения."""
@@ -3835,12 +4051,26 @@ model_submenu.show_all()
 model_menu_item = Gtk.MenuItem(label="📊 Модель диктовки")
 model_menu_item.set_submenu(model_submenu)
 whisper_settings_submenu.append(model_menu_item)
+
+def on_local_condition_on_previous_text_toggled(item):
+    value = load_voice_config()
+    value["condition_on_previous_text"] = item.get_active()
+    save_voice_config(value)
+    log_debug("Локальный Whisper condition_on_previous_text=" + str(item.get_active()).lower())
+
+whisper_settings_submenu.append(Gtk.SeparatorMenuItem())
+local_condition_item = Gtk.CheckMenuItem(label="Учитывать предыдущий текст")
+local_condition_item.set_active(load_voice_config().get("condition_on_previous_text", True))
+local_condition_item.set_tooltip_text(
+    "Передавать предыдущий сегмент как контекст следующему. Отключите, если появляются повторы или зацикливание.")
+local_condition_item.connect("toggled", on_local_condition_on_previous_text_toggled)
+whisper_settings_submenu.append(local_condition_item)
 update_model_label()
 
 voice_config = load_voice_config()
 corrector_config = voice_config.get("corrector", {})
 corrector_submenu = Gtk.Menu()
-corrector_enabled_item = Gtk.CheckMenuItem(label="Включить после ASR (локально)")
+corrector_enabled_item = Gtk.CheckMenuItem(label="Включить локальный корректор (приоритетный)")
 corrector_enabled_item.set_active(corrector_config.get("enabled", False))
 corrector_enabled_item.connect("toggled", on_corrector_enabled_toggled)
 corrector_submenu.append(corrector_enabled_item)
@@ -3903,7 +4133,7 @@ autoreplacements_item = Gtk.MenuItem(label="📝 Автозамены…")
 autoreplacements_item.connect("activate", on_autoreplacements_clicked)
 corrector_submenu.append(autoreplacements_item)
 corrector_submenu.show_all()
-corrector_menu_item = Gtk.MenuItem(label="✍️ Корректор")
+corrector_menu_item = Gtk.MenuItem(label="✍️ Корректор локальный")
 corrector_menu_item.set_submenu(corrector_submenu)
 update_corrector_label()
 
@@ -3999,8 +4229,9 @@ audio_restore_item = Gtk.MenuItem(label="🔊 Восстановить звук"
 audio_restore_item.connect("activate", on_audio_restore_clicked)
 whisper_settings_submenu.append(audio_restore_item)
 whisper_settings_submenu.show_all()
-whisper_settings_item = Gtk.MenuItem(label="⚙️ Настройки Whisper")
+whisper_settings_item = Gtk.MenuItem(label="🎙️ Whisper локальный")
 whisper_settings_item.set_submenu(whisper_settings_submenu)
+menu.append(cloudflare_menu_item)
 menu.append(whisper_settings_item)
 menu.append(corrector_menu_item)
 
@@ -4008,7 +4239,6 @@ menu.append(Gtk.SeparatorMenuItem())
 
 history_item = Gtk.MenuItem(label="📖 История транскрибации")
 history_item.connect("activate", open_history)
-menu.append(history_item)
 
 error_logs_item = Gtk.MenuItem(label="❌ Логи ошибок")
 error_logs_item.connect("activate", open_error_logs)
@@ -4021,10 +4251,9 @@ logs_submenu.append(work_logs_item)
 logs_submenu.show_all()
 logs_menu_item = Gtk.MenuItem(label="📋 Логи")
 logs_menu_item.set_submenu(logs_submenu)
-menu.append(logs_menu_item)
 
 def open_user_guide(_item):
-    """Open the installed guide in a text editor, then xdg-open as fallback."""
+    """Open the installed guide with a text editor, then xdg-open as fallback."""
     guide_path = os.path.expanduser("~/.local/share/doc/whisper-dictate/guide.md")
     if not os.path.isfile(guide_path):
         log_debug(f"✗ Руководство не найдено: {guide_path}")
@@ -4042,7 +4271,6 @@ def open_user_guide(_item):
 
 guide_item = Gtk.MenuItem(label="⌨️ Горячие клавиши и установка")
 guide_item.connect("activate", open_user_guide)
-menu.append(guide_item)
 
 github_url = "https://github.com/maxsannikov/whisper-dictate"
 
@@ -4054,7 +4282,16 @@ def open_project_github(_item):
 
 github_item = Gtk.MenuItem(label="🌐 GitHub проекта")
 github_item.connect("activate", open_project_github)
-menu.append(github_item)
+
+help_submenu = Gtk.Menu()
+help_submenu.append(history_item)
+help_submenu.append(logs_menu_item)
+help_submenu.append(guide_item)
+help_submenu.append(github_item)
+help_submenu.show_all()
+help_menu_item = Gtk.MenuItem(label="❔ Помощь")
+help_menu_item.set_submenu(help_submenu)
+menu.append(help_menu_item)
 
 menu.append(Gtk.SeparatorMenuItem())
 quit_item = Gtk.MenuItem(label="Выход")
@@ -4086,7 +4323,7 @@ def poll_jobs():
     batch_entries = build_batch_display_entries()
 
     signature = (
-        tuple((j.get("state"), j.get("device"), j.get("model")) for j in jobs),
+        tuple((j.get("state"), j.get("device"), j.get("backend"), j.get("pipeline_stage"), j.get("model")) for j in jobs),
         tuple(e["label"] for e in batch_entries)
     )
     if signature == _last_signature:
@@ -4102,17 +4339,21 @@ def poll_jobs():
         backend = j.get("backend", j.get("device", "unknown"))
         stage = j.get("pipeline_stage", "")
         action = "запись" if state == "recording" else "обработка"
+        _icon_key, icon_label = backend_status_icon(state, backend, device)
 
-        # Если это файл — показать имя файла вместо модели
-        if source == "file":
+        # During correction the model/backend are more useful than the source filename.
+        if state == "processing" and stage == "correction":
+            label = processing_status_label(model, stage, _icon_key, icon_label)
+        elif source == "file":
             file_path = j.get("file", "unknown")
             file_name = os.path.basename(file_path)
-            label = f"{STATE_EMOJI.get(state,'?')} {file_name} — {action} {DEVICE_EMOJI.get(backend,'❔')} {stage}"
+            label = f"{icon_label} {file_name} — {model}: {stage or action}".rstrip()
         else:
-            # Это микрофон (исходное поведение)
-            label = f"{STATE_EMOJI.get(state,'?')} {model} — {action} {DEVICE_EMOJI.get(backend,'❔')} {stage}"
+            label = f"{icon_label} {model} — {action} {stage}".rstrip()
 
-        display_entries.append({"state": state, "device": device, "label": label})
+        display_entries.append({"state": state, "device": device, "backend": backend,
+                                "model": model, "pipeline_stage": stage,
+                                "status_icon": _icon_key, "label": label})
 
     # Batch jobs показываются одной строкой на весь job, а не по файлу
     display_entries.extend(batch_entries)
@@ -4133,22 +4374,22 @@ def poll_jobs():
     jobs_separator.set_visible(len(display_entries) > 0)
 
     # Определить иконку трея на основе состояния И device
+    recording_entries = [entry for entry in display_entries if entry["state"] == "recording"]
     processing_entries = [entry for entry in display_entries if entry["state"] == "processing"]
-    if processing_entries and any(e["device"] == "cloudflare" for e in processing_entries):
-        icon = ICONS["processing_cloudflare"]
-        tooltip = f"☁️ Обработка Cloudflare ({len(processing_entries)} активно)"
-    elif processing_entries and any(e["device"] == "cuda" for e in processing_entries):
-        icon = ICONS["processing_gpu"]
-        tooltip = f"🎮 Обработка GPU ({len(processing_entries)} активно)"
-    elif processing_entries and any(e["device"] == "cpu" for e in processing_entries):
-        icon = ICONS["processing_cpu"]
-        tooltip = f"🔥 Обработка CPU ({len(processing_entries)} активно)"
-    elif any(e["state"] == "recording" for e in display_entries):
-        icon = ICONS["recording"]
-        tooltip = f"🔴 Запись ({len(display_entries)} активно)"
+    if recording_entries:
+        icon = ICONS[backend_status_icon("recording", "local", "cpu")[0]]
+        tooltip = f"🔴 Запись ({len(recording_entries)} активно)"
     elif processing_entries:
-        icon = ICONS["processing_cpu"]
-        tooltip = f"⚙️ Обработка ({len(processing_entries)} активно)"
+        priority = ("processing_cloudflare", "processing_gpu", "processing_cpu")
+        selected_entry = next((entry for key in priority for entry in processing_entries
+                               if entry.get("status_icon") == key), processing_entries[0])
+        processing_icon = selected_entry.get("status_icon", "processing_cpu")
+        icon = ICONS[processing_icon]
+        tooltip = processing_status_label(selected_entry.get("model"),
+                                          selected_entry.get("pipeline_stage"),
+                                          processing_icon)
+        if len(processing_entries) > 1:
+            tooltip += f" · ещё {len(processing_entries) - 1} задач"
     else:
         icon = ICONS["idle"]
         tooltip = "🎤 Whisper Dictate — ожидание"
@@ -4198,6 +4439,7 @@ update_daemon_control_items()
 GLib.timeout_add(POLL_MS, poll_jobs)
 GLib.timeout_add(POLL_MS, poll_batch_jobs)
 GLib.timeout_add(POLL_MS, poll_youtube_downloads)
+GLib.timeout_add(1000, refresh_last_task_backend_status)
 GLib.timeout_add(2000, update_gpu_info_ui)
 GLib.timeout_add(2000, update_daemon_control_items)
 log_debug("Трей запущен (часы вместо букв)")
