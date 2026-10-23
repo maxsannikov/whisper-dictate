@@ -138,20 +138,22 @@ class CloudflareResponseTests(unittest.TestCase):
         self.assertIn('"processing_cloudflare": "/usr/share/icons/Papirus/24x24/actions/cloud-download.svg"', source)
         self.assertIn('"processing_gpu": "/usr/share/icons/Papirus/24x24/devices/input-gaming.svg"', source)
         self.assertIn('"processing_cpu": "/usr/share/icons/Papirus/24x24/devices/cpu.svg"', source)
+        self.assertIn('indicator.set_icon_full(icon, tooltip)', source)
         self.assertIn('processing_entries = [entry for entry in display_entries if entry["state"] == "processing"]', source)
 
     def test_legacy_cloudflare_toggle_and_live_fallback_routing(self):
         daemon = (Path(__file__).parents[1] / "scripts" / "whisper-daemon.py").read_text(encoding="utf-8")
         self.assertIn('if "cloudflare_asr_enabled" not in raw and isinstance(raw.get("cloudflare_workers_ai_enabled"), bool)', daemon)
         self.assertIn('await prepare_remote_models(value["corrector"]["model"])', daemon)
-        self.assertIn('if job.get("source") == "live_dictation" else {"enabled": False}', daemon)
+        self.assertIn('provider, _cloud_corrector = select_job_backends(source, base_profile)', daemon)
+        self.assertIn('cloudflare_enabled = bool(cloudflare_profile and cloudflare_profile.get("enabled"))', daemon)
 
     def test_cloudflare_failure_delegates_to_local_only_when_enabled(self):
         calls = []
 
         async def cloudflare_call():
             calls.append("cloudflare")
-            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)")
+            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)", "http_429")
 
         async def local_call():
             calls.append("local")
@@ -161,7 +163,9 @@ class CloudflareResponseTests(unittest.TestCase):
             cloudflare_asr.cloudflare_first(cloudflare_call, local_call, fallback_local=True))
         self.assertEqual(result, "Локальная расшифровка.")
         self.assertTrue(used_fallback)
-        self.assertIn("429", reason)
+        self.assertIsInstance(reason, cloudflare_asr.CloudflareError)
+        self.assertEqual(reason.category, "http_429")
+        self.assertIn("429", str(reason))
         self.assertEqual(calls, ["cloudflare", "local"])
 
     def test_cloudflare_failure_does_not_delegate_when_disabled(self):
@@ -169,7 +173,7 @@ class CloudflareResponseTests(unittest.TestCase):
 
         async def cloudflare_call():
             calls.append("cloudflare")
-            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)")
+            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)", "http_429")
 
         async def local_call():
             calls.append("local")

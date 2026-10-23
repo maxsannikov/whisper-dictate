@@ -20,7 +20,7 @@ MODEL_NEURON_RATES = {
 
 def parse_response(payload):
     if not isinstance(payload, dict) or payload.get("success") is False:
-        raise CloudflareError("Некорректный ответ Cloudflare-корректора")
+        raise CloudflareError("Некорректный ответ Cloudflare-корректора", "invalid_response")
     result = payload.get("result")
     text = None
     if isinstance(result, dict):
@@ -31,7 +31,7 @@ def parse_response(payload):
                 message = choices[0].get("message")
                 text = message.get("content") if isinstance(message, dict) else None
     if not isinstance(text, str) or not text.strip():
-        raise CloudflareError("Cloudflare-корректор вернул пустой или некорректный ответ")
+        raise CloudflareError("Cloudflare-корректор вернул пустой или некорректный ответ", "invalid_response")
     usage = result.get("usage", {}) if isinstance(result, dict) else {}
     if not isinstance(usage, dict):
         usage = {}
@@ -59,7 +59,7 @@ def correct(text, model=DEFAULT_MODEL, temperature=0.0, max_tokens=2048,
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
-            raise CloudflareError("Ответ Cloudflare-корректора слишком велик")
+            raise CloudflareError("Ответ Cloudflare-корректора слишком велик", "invalid_response")
         return parse_response(json.loads(raw.decode("utf-8")))
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):

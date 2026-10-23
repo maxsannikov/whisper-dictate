@@ -8,7 +8,8 @@ gi.require_version('AppIndicator3', '0.1')
 from gi.repository import Gtk, AppIndicator3, GLib, Pango, Gdk
 
 sys.path.insert(0, os.path.dirname(__file__))
-from cloudflare_asr import daily_usage as cloudflare_daily_usage
+from cloudflare_asr import (daily_usage as cloudflare_daily_usage,
+                            FREE_DAILY_NEURONS as CLOUDFLARE_LOCAL_DAILY_REFERENCE)
 
 STATE_DIR = os.path.expanduser("~/.cache/whisper-dictate")
 JOBS_DIR = os.path.join(STATE_DIR, "jobs")
@@ -3349,9 +3350,15 @@ def cloudflare_credentials_available():
     if not os.path.isfile(path):
         return False
     try:
+        names = set()
         with open(path, encoding="utf-8") as stream:
-            names = {line.split("=", 1)[0].strip() for line in stream
-                     if "=" in line and not line.lstrip().startswith("#")}
+            for line in stream:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if value.strip().strip("\"'"):
+                    names.add(key.strip())
         return {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}.issubset(names)
     except OSError:
         return False
@@ -3391,8 +3398,13 @@ cloudflare_submenu.append(cloudflare_corrector_toggle)
 
 cloudflare_status = Gtk.MenuItem()
 cloudflare_status.set_sensitive(False)
-cloudflare_status.set_label("✅ Учётные данные доступны" if cloudflare_credentials_available()
-                            else "❌ Нет файла или обязательных переменных")
+
+def refresh_cloudflare_credentials_status(*_args):
+    cloudflare_status.set_label("✅ Учётные данные заполнены" if cloudflare_credentials_available()
+                                else "❌ Нет файла или заполненных обязательных полей")
+
+refresh_cloudflare_credentials_status()
+cloudflare_submenu.connect("show", refresh_cloudflare_credentials_status)
 cloudflare_submenu.append(Gtk.SeparatorMenuItem())
 cloudflare_submenu.append(cloudflare_status)
 cloudflare_usage = Gtk.MenuItem()
@@ -3400,18 +3412,95 @@ cloudflare_usage.set_sensitive(False)
 
 def refresh_cloudflare_usage(*_args):
     usage = cloudflare_daily_usage(METRICS_FILE)
+    cloudflare_usage.set_label(format_cloudflare_usage_label(usage, CLOUDFLARE_LOCAL_DAILY_REFERENCE))
+
+def format_cloudflare_usage_label(usage, daily_reference):
     correction = usage.get("corrector_estimated_neurons", 0)
     total = int(usage["estimated_neurons"] + correction + 0.5)
     correction_basis = "оценка токенов" if usage.get("corrector_estimated_token_requests", 0) else "usage API/токены"
     minutes = usage["audio_seconds"] / 60
-    cloudflare_usage.set_label(
-        f"~{total:,} нейронов "
+    estimated_remaining = max(0, daily_reference - total)
+    return (
+        f"~{total:,} нейронов за UTC-день; расчётный остаток ~{estimated_remaining:,} из "
+        f"{daily_reference:,} "
         f"(ASR ~{int(usage['estimated_neurons']):,}; корректор ~{int(correction):,}, {correction_basis}); "
-        f"ASR ~{minutes:.1f} мин, {usage['requests']} запросов".replace(",", " "))
+        f"ASR ~{minutes:.1f} мин, {usage['requests']} запросов; не проверка фактической квоты".replace(",", " "))
+
+cloudflare_last_attempt = Gtk.MenuItem()
+cloudflare_last_attempt.set_sensitive(False)
+
+def latest_cloudflare_attempt(metrics_path):
+    """Return the latest safe Cloudflare attempt fields, skipping local-only jobs."""
+    latest = None
+    allowed = ("timestamp", "asr_backend", "asr_device", "corrector_backend", "corrector_device",
+               "cloudflare_asr_error_category", "cloudflare_corrector_error_category")
+    try:
+        with open(metrics_path, encoding="utf-8") as source:
+            for line in source:
+                try:
+                    record = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(record, dict) and record.get("cloudflare_attempted") is True:
+                    latest = {key: record[key] for key in allowed if key in record}
+    except OSError:
+        pass
+    return latest
+
+def cloudflare_error_reason(category):
+    return {
+        "http_429": "лимит/частота запросов (429)",
+        "http_401_403": "Cloudflare отклонил доступ (401/403); проверьте токен и права",
+        "missing_credentials": "не найдены обязательные учётные данные",
+        "credentials_read_error": "не удалось прочитать файл учётных данных",
+        "network_error": "сетевая ошибка",
+        "timeout": "истёк тайм-аут запроса",
+        "http_error": "ошибка API Cloudflare",
+        "invalid_response": "ответ Cloudflare некорректен",
+        "local_audio_error": "не удалось прочитать аудиофайл для Cloudflare",
+        "other_error": "неопределённая ошибка; подробности скрыты",
+    }.get(category, "ошибка Cloudflare (категория не распознана)")
+
+def format_cloudflare_attempt_status(record):
+    if not record:
+        return "Последняя попытка Cloudflare: ещё не выполнялась"
+    labels = []
+    for stage, title, backend_key, category_key in (
+            ("whisper", "Whisper", "asr_backend", "cloudflare_asr_error_category"),
+            ("corrector", "Корректор", "corrector_backend", "cloudflare_corrector_error_category")):
+        category = record.get(category_key)
+        backend = record.get(backend_key)
+        if category:
+            state = cloudflare_error_reason(category)
+            if backend in {"local", "local_fallback"}:
+                device = record.get("asr_device") if stage == "whisper" else record.get("corrector_device")
+                local_label = "локальный GPU" if device == "cuda" else "локальный CPU" if device == "cpu" else "локально"
+                state += f" → fallback: {local_label}"
+            labels.append(f"{title}: {state}")
+        elif backend == "cloudflare":
+            labels.append(f"{title}: Cloudflare — успешно")
+    if not labels:
+        labels.append("Cloudflare: запрос выполнен без зафиксированной ошибки")
+    timestamp = record.get("timestamp")
+    if timestamp:
+        try:
+            moment = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).astimezone()
+            labels.append(moment.strftime("%d.%m %H:%M"))
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return "Последняя попытка: " + "; ".join(labels)
+
+def refresh_cloudflare_last_attempt(*_args):
+    cloudflare_last_attempt.set_label(
+        format_cloudflare_attempt_status(latest_cloudflare_attempt(METRICS_FILE)))
 
 refresh_cloudflare_usage()
 cloudflare_submenu.connect("show", refresh_cloudflare_usage)
 cloudflare_submenu.append(cloudflare_usage)
+cloudflare_submenu.append(Gtk.SeparatorMenuItem())
+refresh_cloudflare_last_attempt()
+cloudflare_submenu.connect("show", refresh_cloudflare_last_attempt)
+cloudflare_submenu.append(cloudflare_last_attempt)
 cloudflare_submenu.append(Gtk.SeparatorMenuItem())
 
 def set_cloudflare_asr_value(item, key, selected, is_toggle=False):

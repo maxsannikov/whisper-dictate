@@ -380,7 +380,8 @@ def ollama_loaded_device(model_name, requested_device):
                 return requested_device
     return requested_device
 
-def correct_text_sync(text, corrector, cloudflare_profile=None, backend_callback=None):
+def correct_text_sync(text, corrector, cloudflare_profile=None, backend_callback=None,
+                      cloudflare_failure_callback=None):
     """Correct safely in bounded chunks; retry once, then retain raw ASR chunk."""
     text = normalize_asr_text(text)
     cloudflare_enabled = bool(cloudflare_profile and cloudflare_profile.get("enabled"))
@@ -407,6 +408,8 @@ def correct_text_sync(text, corrector, cloudflare_profile=None, backend_callback
                                    input_tokens, output_tokens, cloudflare_profile["model"])}
         except Exception as error:
             logger.warning("Cloudflare corrector failed (%s); local correction used", type(error).__name__)
+            if cloudflare_failure_callback:
+                cloudflare_failure_callback(error)
             if backend_callback:
                 backend_callback("local")
             # The local corrector is the mandatory fallback even if its separate
@@ -512,12 +515,28 @@ def update_job_backend(job_id, backend, profile, cloud_model=DEFAULT_CLOUDFLARE_
     except (OSError, ValueError, json.JSONDecodeError):
         pass
 
+SAFE_CLOUDFLARE_ERROR_CATEGORIES = {
+    "missing_credentials", "credentials_read_error", "http_401_403", "http_429",
+    "http_error", "network_error", "timeout", "invalid_response",
+    "local_audio_error", "other_error",
+}
+
+def cloudflare_error_category(error):
+    """Return only a small allowlist of non-sensitive provider error categories."""
+    category = getattr(error, "category", None)
+    return category if category in SAFE_CLOUDFLARE_ERROR_CATEGORIES else "other_error"
+
 async def run(job):
     global qwen_lease
     qwen_lease += 1
     value, wav = job["profile"], job["wav"]
     provider = job.get("provider", "local")
     cloudflare_failed = False
+    cloudflare_event = {
+        "cloudflare_attempted": provider == "cloudflare",
+        "cloudflare_asr_error_category": None,
+        "cloudflare_corrector_error_category": None,
+    }
     _planned_asr_provider, planned_corrector = select_job_backends(job.get("source"), value)
     planned_asr_model = (value.get("cloudflare_asr", {}).get("model", value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo"))
                          if provider == "cloudflare" else value.get("model"))
@@ -533,7 +552,7 @@ async def run(job):
                                            ("cuda" if int(value.get("corrector", {}).get("num_gpu", 0) or 0) > 0 else "cpu")
                                            if planned_corrector_backend == "local" else None}
     if not os.path.isfile(wav):
-        return {"status":"error","message":"Audio file not found","error_code":"audio_not_found", **initial_metadata}
+        return {"status":"error","message":"Audio file not found","error_code":"audio_not_found", **initial_metadata, **cloudflare_event}
     selected_cf_asr = value.get("cloudflare_asr", {}).get("model", value.get("cloudflare_asr_model", "@cf/openai/whisper-large-v3-turbo"))
     update_job_backend(job.get("job_id"), "cloudflare" if provider == "cloudflare" else "local", value,
                        selected_cf_asr if provider == "cloudflare" else value["cloudflare_corrector"]["model"])
@@ -561,6 +580,7 @@ async def run(job):
             if not cloudflare_failed:
                 asyncio.create_task(delayed_whisper_release())
             if cloudflare_failed:
+                cloudflare_event["cloudflare_asr_error_category"] = cloudflare_error_category(cloudflare_error)
                 fallback = "cloudflare_to_local"
                 logger.warning("Cloudflare ASR failed (%s); local ASR used", cloudflare_error)
         else:
@@ -576,7 +596,7 @@ async def run(job):
             return {"status":"error","message":"Empty transcription","error_code":"empty_transcription",
                     **{k:value[k] for k in ("model","device","compute_type")},
                     "asr_backend":asr_backend,"asr_model":asr_model_name,"asr_device":asr_device,
-                    "corrector_backend":"not_run"}
+                    "corrector_backend":"not_run", **cloudflare_event}
         corrector, large_cpu_corrector = large_corrector_profile(value)
         _correction_provider, cloud_corrector = select_job_backends(job.get("source"), value)
         if cloud_corrector.get("enabled"):
@@ -596,7 +616,13 @@ async def run(job):
             await asyncio.to_thread(unload_corrector_model, corrector["model"])
         correction_device = "cuda" if int(corrector.get("num_gpu", 0) or 0) > 0 else "cpu"
         correction_status = {"device": None}
+        def report_cloudflare_correction_failure(error):
+            cloudflare_event["cloudflare_attempted"] = True
+            cloudflare_event["cloudflare_corrector_error_category"] = cloudflare_error_category(error)
+
         def report_correction_backend(backend, actual_device=None):
+            if backend == "cloudflare":
+                cloudflare_event["cloudflare_attempted"] = True
             correction_status["device"] = ("cloudflare" if backend == "cloudflare"
                                             else actual_device or correction_device)
             model_name = (value["cloudflare_corrector"]["model"] if backend == "cloudflare"
@@ -605,7 +631,7 @@ async def run(job):
                                stage="correction", device=correction_status["device"])
         text, correction_fallback, correction_seconds, correction_backend, correction_usage = await asyncio.to_thread(
             correct_text_sync, text, corrector, cloud_corrector,
-            report_correction_backend)
+            report_correction_backend, report_cloudflare_correction_failure)
         if correction_backend == "cloudflare":
             asyncio.create_task(delayed_whisper_release())
             asyncio.create_task(delayed_qwen_release(corrector["model"]))
@@ -623,20 +649,22 @@ async def run(job):
                 "fallback":fallback,"model":model_name,"device":"cloudflare" if used_cloudflare or correction_backend == "cloudflare" else value["device"],"compute_type":"remote" if used_cloudflare or correction_backend == "cloudflare" else value["compute_type"],
                 "asr_backend":asr_backend,"asr_model":asr_model_name,"asr_device":asr_device,
                 "corrector_backend":correction_backend,"corrector_model":corrector_model_name,
-                "corrector_device":corrector_device,"corrector_usage":correction_usage}
+                "corrector_device":corrector_device,"corrector_usage":correction_usage, **cloudflare_event}
     except CloudflareError as error:
         return {"status":"error","message":str(error),"error_code":"cloudflare_asr_failed","error_category":getattr(error, "category", "invalid_response"),
-                "model":planned_asr_model,"device":"cloudflare","compute_type":"remote", **initial_metadata}
+                "model":planned_asr_model,"device":"cloudflare","compute_type":"remote", **initial_metadata,
+                **cloudflare_event, "cloudflare_attempted":True,
+                "cloudflare_asr_error_category":cloudflare_error_category(error)}
     except Exception as error:
         if not is_oom(error):
             logger.error("ASR failed model=%s device=%s", value["model"], value["device"])
             return {"status":"error","message":"ASR failed; see local daemon log","error_code":"asr_failed",
-                    **{k:value[k] for k in ("model","device","compute_type")}, **initial_metadata}
+                    **{k:value[k] for k in ("model","device","compute_type")}, **initial_metadata, **cloudflare_event}
         logger.warning("OOM model=%s device=%s; applying configured fallback once", value["model"], value["device"])
         await release(); fb = dict(value["fallback"])
         if fb["device"] == "cpu" and not fb["allow_cpu"]:
             return {"status":"error","message":"CUDA memory exhausted; CPU fallback is disabled",
-                    "error_code":"oom_cpu_fallback_disabled",**{k:value[k] for k in ("model","device","compute_type")}, **initial_metadata}
+                    "error_code":"oom_cpu_fallback_disabled",**{k:value[k] for k in ("model","device","compute_type")}, **initial_metadata, **cloudflare_event}
         retry = dict(value); retry.update(fb)
         update_job_backend(job.get("job_id"), "local", retry, stage="asr")
         fallback = f'{fb["model"]}:{fb["device"]}:{fb["compute_type"]}'
@@ -648,13 +676,13 @@ async def run(job):
                 return {"status":"ok","text":text,"cold_start":cold,"asr_seconds":round(elapsed,3),
                         "fallback":fallback,**{k:retry[k] for k in ("model","device","compute_type")},
                         "asr_backend":"local","asr_model":retry["model"],"asr_device":retry["device"],
-                        "corrector_backend":"not_run","corrector_model":None,"corrector_device":None}
+                        "corrector_backend":"not_run","corrector_model":None,"corrector_device":None, **cloudflare_event}
         except Exception: pass
         logger.error("Configured OOM fallback failed model=%s device=%s", retry["model"], retry["device"])
         return {"status":"error","message":"ASR fallback failed; see local daemon log",
                 "error_code":"fallback_failed","fallback":fallback, **initial_metadata,
                 **{k:retry[k] for k in ("model","device","compute_type")},
-                "asr_backend":"local","asr_model":retry["model"],"asr_device":retry["device"]}
+                "asr_backend":"local","asr_model":retry["model"],"asr_device":retry["device"], **cloudflare_event}
 
 async def worker():
     while True:
@@ -675,6 +703,9 @@ async def worker():
                 "asr_seconds":result.get("asr_seconds"),"correction_seconds":result.get("correction_seconds"), "correction_fallback":result.get("correction_fallback"), "correction_mode":result.get("correction_mode"), "total_seconds":round(time.monotonic()-started,3),
                 "queue_wait_seconds":round(started-job["queued"],3),"fallback":result.get("fallback"),
                 "asr_backend":result.get("asr_backend"),"corrector_backend":result.get("corrector_backend"),
+                "cloudflare_attempted":result.get("cloudflare_attempted", False),
+                "cloudflare_asr_error_category":result.get("cloudflare_asr_error_category"),
+                "cloudflare_corrector_error_category":result.get("cloudflare_corrector_error_category"),
                 "corrector_usage":result.get("corrector_usage"),
                 "error_code":result.get("error_code"),"error_category":result.get("error_category")})
         except Exception:

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -79,6 +80,69 @@ class BackendStatusPipelineTests(unittest.TestCase):
         self.assertEqual(len(labels), 6)  # four actions, status, separator
         self.assertIn("menu.append(last_task_status_item)", labels[4])
         self.assertIn("SeparatorMenuItem", labels[5])
+
+    def test_cloudflare_status_explains_rate_limit_and_local_fallback(self):
+        source = (ROOT / "scripts/whisper-tray.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        names = {"cloudflare_error_reason", "format_cloudflare_attempt_status",
+                 "format_cloudflare_usage_label"}
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        namespace = {"datetime": datetime}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "cloudflare-menu-status", "exec"), namespace)
+        status = namespace["format_cloudflare_attempt_status"]({
+            "timestamp": "2026-10-23T12:34:00+00:00",
+            "asr_backend": "local", "asr_device": "cuda",
+            "cloudflare_asr_error_category": "http_429",
+            "corrector_backend": "cloudflare",
+        })
+        self.assertIn("лимит/частота запросов (429)", status)
+        self.assertIn("fallback: локальный GPU", status)
+        self.assertIn("Корректор: Cloudflare — успешно", status)
+
+    def test_cloudflare_status_maps_credentials_and_network_failures(self):
+        source = (ROOT / "scripts/whisper-tray.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name in {"cloudflare_error_reason", "format_cloudflare_attempt_status"}]
+        namespace = {"datetime": datetime}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), "cloudflare-error-map", "exec"), namespace)
+        explain = namespace["cloudflare_error_reason"]
+        self.assertIn("токен и права", explain("http_401_403"))
+        self.assertIn("сетевая ошибка", explain("network_error"))
+        self.assertIn("ещё", namespace["format_cloudflare_attempt_status"]({}))
+
+    def test_cloudflare_attempt_reader_skips_local_jobs_and_redacts_metrics(self):
+        source = (ROOT / "scripts/whisper-tray.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "latest_cloudflare_attempt")
+        namespace = {"json": json}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "latest-cloudflare-event", "exec"), namespace)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics = Path(temp_dir) / "metrics.jsonl"
+            metrics.write_text("\n".join(json.dumps(row) for row in (
+                {"cloudflare_attempted": False, "timestamp": "local-only"},
+                {"cloudflare_attempted": True, "timestamp": "2026-10-23T12:00:00+00:00",
+                 "asr_backend": "local", "asr_device": "cuda",
+                 "cloudflare_asr_error_category": "http_429", "transcript": "private text"},
+            )), encoding="utf-8")
+            record = namespace["latest_cloudflare_attempt"](metrics)
+        self.assertEqual(record["cloudflare_asr_error_category"], "http_429")
+        self.assertNotIn("transcript", record)
+
+    def test_cloudflare_usage_is_explicitly_an_estimate(self):
+        source = (ROOT / "scripts/whisper-tray.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "format_cloudflare_usage_label")
+        namespace = {}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "cloudflare-usage-label", "exec"), namespace)
+        label = namespace["format_cloudflare_usage_label"]({
+            "estimated_neurons": 200, "corrector_estimated_neurons": 50,
+            "corrector_estimated_token_requests": 1, "audio_seconds": 120, "requests": 1,
+        }, 10_000)
+        self.assertIn("расчётный остаток ~9 750", label)
+        self.assertIn("не проверка фактической квоты", label)
 
     def test_loaded_qwen_device_uses_ollama_vram_metadata(self):
         source = (ROOT / "scripts/whisper-daemon.py").read_text(encoding="utf-8")

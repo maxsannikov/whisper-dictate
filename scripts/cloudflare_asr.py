@@ -86,7 +86,7 @@ async def cloudflare_first(cloudflare_call, local_call, fallback_local=False):
         result = local_call()
         if inspect.isawaitable(result):
             result = await result
-        return result, True, str(error)
+        return result, True, error
 
 
 def parse_response(payload):
@@ -102,7 +102,7 @@ def parse_response(payload):
 
 def read_credentials(path=ENV_FILE):
     if not path.is_file():
-        raise CloudflareError("Не найден файл учётных данных Cloudflare")
+        raise CloudflareError("Не найден файл учётных данных Cloudflare", "missing_credentials")
     values = {}
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -113,22 +113,35 @@ def read_credentials(path=ENV_FILE):
             if key.strip() in {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"}:
                 values[key.strip()] = value.strip().strip("\"'")
     except OSError:
-        raise CloudflareError("Не удалось прочитать файл учётных данных Cloudflare") from None
+        raise CloudflareError("Не удалось прочитать файл учётных данных Cloudflare", "credentials_read_error") from None
     if not values.get("CLOUDFLARE_ACCOUNT_ID") or not values.get("CLOUDFLARE_API_TOKEN"):
-        raise CloudflareError("В файле Cloudflare отсутствует Account ID или API Token")
+        raise CloudflareError("В файле Cloudflare отсутствует Account ID или API Token", "missing_credentials")
     return values["CLOUDFLARE_ACCOUNT_ID"], values["CLOUDFLARE_API_TOKEN"]
 
 
-def transcribe(audio_path, language="ru", vad=True, initial_prompt="", model=MODEL):
+def transcribe(audio_path, language="ru", vad=True, initial_prompt="", model=MODEL, settings=None):
     account_id, token = read_credentials()
     try:
         audio = base64.b64encode(Path(audio_path).read_bytes()).decode("ascii")
     except OSError:
-        raise CloudflareError("Не удалось прочитать аудиофайл") from None
-    body = {"audio": audio, "task": "transcribe", "language": language or "ru",
+        raise CloudflareError("Не удалось прочитать аудиофайл", "local_audio_error") from None
+    settings = settings if isinstance(settings, dict) else {}
+    language = language or ""
+    body = {"audio": audio,
+            "task": settings.get("task", "transcribe"),
             "vad_filter": bool(vad)}
-    if initial_prompt:
-        body["initial_prompt"] = initial_prompt
+    if language:
+        body["language"] = language
+    if model == MODEL:
+        body["beam_size"] = settings.get("beam_size", 1)
+        body["condition_on_previous_text"] = settings.get("condition_on_previous_text", True)
+        if initial_prompt:
+            body["initial_prompt"] = initial_prompt
+        if settings.get("prefix"):
+            body["prefix"] = settings["prefix"]
+        for key in ("no_speech_threshold", "compression_ratio_threshold", "log_prob_threshold", "hallucination_silence_threshold"):
+            if settings.get(key) is not None:
+                body[key] = settings[key]
     url = ("https://api.cloudflare.com/client/v4/accounts/" + account_id
            + "/ai/run/" + (model if model in {MODEL, "@cf/openai/whisper"} else MODEL))
     request = urllib.request.Request(
