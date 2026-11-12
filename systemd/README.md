@@ -36,6 +36,9 @@ StartLimitInterval=60
 StartLimitBurst=5
 
 Environment="PYTHONUNBUFFERED=1"
+PassEnvironment=http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+Environment="NO_PROXY=localhost,127.0.0.1,::1"
+Environment="no_proxy=localhost,127.0.0.1,::1"
 
 StandardOutput=journal
 StandardError=journal
@@ -51,6 +54,8 @@ WantedBy=default.target
 - `RestartSec=5` — перезапуск через 5 секунд
 - `StartLimitBurst=5` — максимум 5 рестартов за 60 сек
 - `StandardOutput=journal` — логи идут в systemd journal
+- `PassEnvironment=...` — берёт proxy variables из окружения user manager, не записывая endpoint или credentials в unit.
+- `NO_PROXY` — оставляет loopback-трафик локальным; удалённые providers и CLI могут использовать manager proxy.
 
 ### whisper-tray.service
 
@@ -422,4 +427,3 @@ systemctl --user start whisper-daemon-restart.timer
 ---
 
 **Последнее обновление:** 2026-08-01
-
