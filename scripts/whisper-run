@@ -67,6 +67,7 @@ model = WhisperModel(
     model_name,
     device=device,
     compute_type=compute_type,
+    local_files_only=True,
 )
 
 segments, info = model.transcribe(
