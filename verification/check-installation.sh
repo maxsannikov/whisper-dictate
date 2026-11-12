@@ -131,7 +131,7 @@ for script in "${SCRIPTS[@]}"; do
     fi
 done
 
-MODULES=("cloudflare_asr.py" "cloudflare_corrector.py")
+MODULES=("cloudflare_asr.py" "cloudflare_corrector.py" "multi_provider.py")
 for module in "${MODULES[@]}"; do
     if [[ -f "$WHISPER_BIN_DIR/$module" ]]; then
         pass "Python module: $module"

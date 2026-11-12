@@ -14,6 +14,8 @@ WHISPER_BIN_DIR="$HOME/.local/bin/whisper"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 CACHE_DIR="$HOME/.cache/whisper-dictate"
 DESKTOP_DIR="$HOME/.local/share/applications"
+APP_ICON="$HOME/.local/share/whisper-dictate/menu-icons/microphone.png"
+LEGACY_APP_ICON="$HOME/.local/share/pixmaps/whisper-dictate.png"
 
 log() {
     echo -e "${BLUE}[UNINSTALL]${NC} $1"
@@ -45,6 +47,8 @@ echo "  • $WHISPER_BIN_DIR"
 echo "  • $SYSTEMD_USER_DIR/whisper-daemon.service"
 echo "  • $SYSTEMD_USER_DIR/whisper-tray.service"
 echo "  • $DESKTOP_DIR/whisper-dictate.desktop"
+echo "  • $APP_ICON"
+echo "  • $LEGACY_APP_ICON (legacy launcher icon, if present)"
 echo ""
 echo -e "${YELLOW}Preserved (for safety):${NC}"
 echo "  • $CACHE_DIR (configuration and cache)"
@@ -85,6 +89,8 @@ rm -f "$SYSTEMD_USER_DIR/whisper-tray.service" && success "whisper-tray.service 
 
 # Remove desktop entry
 rm -f "$DESKTOP_DIR/whisper-dictate.desktop" && success "Desktop entry removed"
+rm -f "$APP_ICON" && success "Application icon removed"
+rm -f "$LEGACY_APP_ICON" && success "Legacy application icon removed"
 
 # Reload systemd
 systemctl --user daemon-reload && success "systemd daemon reloaded"

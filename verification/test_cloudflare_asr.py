@@ -67,7 +67,8 @@ class CloudflareResponseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             metrics = Path(directory) / "metrics.jsonl"
             metrics.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
-            usage = cloudflare_asr.daily_usage(metrics, now)
+            with patch.object(cloudflare_asr, "USAGE_PATH", Path(directory) / "usage.json"):
+                usage = cloudflare_asr.daily_usage(metrics, now)
         self.assertEqual(usage["requests"], 1)
         self.assertEqual(usage["audio_seconds"], 120)
         self.assertAlmostEqual(usage["estimated_neurons"], 2 * 46.63)
@@ -75,6 +76,23 @@ class CloudflareResponseTests(unittest.TestCase):
         self.assertEqual(usage["corrector_requests"], 2)
         self.assertEqual(usage["corrector_estimated_token_requests"], 1)
         self.assertEqual(usage["corrector_estimated_neurons"], 2.25)
+
+    def test_estimated_neuron_budget_reserves_atomically_and_resets_at_utc_midnight(self):
+        now = cloudflare_asr.datetime(2026, 10, 23, 23, 59, tzinfo=cloudflare_asr.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = Path(directory) / "metrics.jsonl"
+            state = Path(directory) / "cloudflare-usage.json"
+            self.assertTrue(cloudflare_asr.reserve_daily_neurons(metrics, 9900, state, now))
+            self.assertFalse(cloudflare_asr.reserve_daily_neurons(metrics, 101, state, now))
+            self.assertTrue(cloudflare_asr.reserve_daily_neurons(metrics, 100, state, now))
+            self.assertFalse(cloudflare_asr.reserve_daily_neurons(metrics, 0.1, state, now))
+            next_day = cloudflare_asr.datetime(2026, 10, 24, 0, 0,
+                                               tzinfo=cloudflare_asr.timezone.utc)
+            self.assertTrue(cloudflare_asr.reserve_daily_neurons(metrics, 100, state, next_day))
+            with patch.object(cloudflare_asr, "USAGE_PATH", state):
+                usage = cloudflare_asr.daily_usage(metrics, next_day)
+            self.assertAlmostEqual(usage["reserved_neurons"], 100)
+            self.assertAlmostEqual(usage["estimated_remaining"], 9900)
 
     def test_http_error_log_does_not_include_secrets_or_response_body(self):
         token = "test-api-token-must-never-appear"
@@ -130,14 +148,30 @@ class CloudflareResponseTests(unittest.TestCase):
         source = (Path(__file__).parents[1] / "scripts" / "whisper-tray.py").read_text(encoding="utf-8")
         self.assertIn("cloudflare_daily_usage(METRICS_FILE)", source)
         self.assertIn('cloudflare_submenu.connect("show", refresh_cloudflare_usage)', source)
-        self.assertIn("Оценка расхода по локальным метрикам (UTC)", source)
+        self.assertNotIn("Оценка расхода по локальным метрикам", source)
+        self.assertIn("~{fmt(int(usage['estimated_neurons']))} нейронов", source)
+
+    def test_tray_uses_single_cloud_gpu_or_cpu_status_icon(self):
+        source = (Path(__file__).parents[1] / "scripts" / "whisper-tray.py").read_text(encoding="utf-8")
+        self.assertIn('"processing_cloudflare": provider_status_icon("cloudflare"', source)
+        self.assertIn('"processing_gpu": "/usr/share/icons/Papirus/24x24/devices/input-gaming.svg"', source)
+        self.assertIn('"processing_cpu": "/usr/share/icons/Papirus/24x24/devices/cpu.svg"', source)
+        self.assertIn('indicator.set_icon_full(icon, tooltip)', source)
+        self.assertIn('processing_entries = [entry for entry in display_entries if entry["state"] == "processing"]', source)
+
+    def test_legacy_cloudflare_toggle_and_live_fallback_routing(self):
+        daemon = (Path(__file__).parents[1] / "scripts" / "whisper-daemon.py").read_text(encoding="utf-8")
+        self.assertIn('if "cloudflare_asr_enabled" not in raw and isinstance(raw.get("cloudflare_workers_ai_enabled"), bool)', daemon)
+        self.assertIn('await prepare_remote_models(value["corrector"]["model"])', daemon)
+        self.assertIn('provider, _cloud_corrector = select_job_backends(source, base_profile)', daemon)
+        self.assertIn('cloudflare_enabled = bool(cloudflare_profile and cloudflare_profile.get("enabled"))', daemon)
 
     def test_cloudflare_failure_delegates_to_local_only_when_enabled(self):
         calls = []
 
         async def cloudflare_call():
             calls.append("cloudflare")
-            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)")
+            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)", "http_429")
 
         async def local_call():
             calls.append("local")
@@ -147,7 +181,9 @@ class CloudflareResponseTests(unittest.TestCase):
             cloudflare_asr.cloudflare_first(cloudflare_call, local_call, fallback_local=True))
         self.assertEqual(result, "Локальная расшифровка.")
         self.assertTrue(used_fallback)
-        self.assertIn("429", reason)
+        self.assertIsInstance(reason, cloudflare_asr.CloudflareError)
+        self.assertEqual(reason.category, "http_429")
+        self.assertIn("429", str(reason))
         self.assertEqual(calls, ["cloudflare", "local"])
 
     def test_cloudflare_failure_does_not_delegate_when_disabled(self):
@@ -155,7 +191,7 @@ class CloudflareResponseTests(unittest.TestCase):
 
         async def cloudflare_call():
             calls.append("cloudflare")
-            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)")
+            raise cloudflare_asr.CloudflareError("Cloudflare Workers AI достиг лимита запросов (429)", "http_429")
 
         async def local_call():
             calls.append("local")

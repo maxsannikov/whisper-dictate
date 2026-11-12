@@ -1,0 +1,10 @@
+[Icon Theme]
+Name=Whisper Dictate Safe Fallback
+Comment=PNG fallback for GTK's missing-image placeholder
+Inherits=Adwaita,hicolor
+Directories=status/16
+
+[status/16]
+Size=16
+Type=Fixed
+Context=Status

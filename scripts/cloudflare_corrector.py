@@ -5,9 +5,14 @@ import math
 import urllib.error
 import urllib.request
 
-from cloudflare_asr import CloudflareError, read_credentials
+from cloudflare_asr import CloudflareError, cloudflare_http_error_category, read_credentials
 
 DEFAULT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
+SUPPORTED_MODELS = (
+    DEFAULT_MODEL,
+    "@cf/zai-org/glm-4.7-flash",
+    "@cf/openai/gpt-oss-20b",
+)
 TIMEOUT_SECONDS = 90
 MAX_RESPONSE_BYTES = 1_000_000
 # Cloudflare model card: $0.0509/M input, $0.335/M output; pricing page:
@@ -15,12 +20,13 @@ MAX_RESPONSE_BYTES = 1_000_000
 MODEL_NEURON_RATES = {
     DEFAULT_MODEL: (4627.272727, 30454.545455),
     "@cf/zai-org/glm-4.7-flash": (5500.0, 36400.0),
+    "@cf/openai/gpt-oss-20b": (18182.0, 27273.0),
 }
 
 
 def parse_response(payload):
     if not isinstance(payload, dict) or payload.get("success") is False:
-        raise CloudflareError("Некорректный ответ Cloudflare-корректора")
+        raise CloudflareError("Некорректный ответ Cloudflare-корректора", "invalid_response")
     result = payload.get("result")
     text = None
     if isinstance(result, dict):
@@ -31,7 +37,7 @@ def parse_response(payload):
                 message = choices[0].get("message")
                 text = message.get("content") if isinstance(message, dict) else None
     if not isinstance(text, str) or not text.strip():
-        raise CloudflareError("Cloudflare-корректор вернул пустой или некорректный ответ")
+        raise CloudflareError("Cloudflare-корректор вернул пустой или некорректный ответ", "invalid_response")
     usage = result.get("usage", {}) if isinstance(result, dict) else {}
     if not isinstance(usage, dict):
         usage = {}
@@ -43,6 +49,13 @@ def parse_response(payload):
 def estimate_neurons(input_tokens, output_tokens, model=DEFAULT_MODEL):
     input_rate, output_rate = MODEL_NEURON_RATES.get(model, MODEL_NEURON_RATES[DEFAULT_MODEL])
     return ((input_tokens * input_rate + output_tokens * output_rate) / 1_000_000)
+
+
+def estimate_request_neurons(text, max_tokens=2048, model=DEFAULT_MODEL):
+    """Conservatively estimate a correction request before sending it."""
+    input_tokens = max(1, math.ceil(len(text) / 4))
+    output_tokens = max(1, int(max_tokens))
+    return estimate_neurons(input_tokens, output_tokens, model)
 
 
 def correct(text, model=DEFAULT_MODEL, temperature=0.0, max_tokens=2048,
@@ -59,16 +72,19 @@ def correct(text, model=DEFAULT_MODEL, temperature=0.0, max_tokens=2048,
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
-            raise CloudflareError("Ответ Cloudflare-корректора слишком велик")
+            raise CloudflareError("Ответ Cloudflare-корректора слишком велик", "invalid_response")
         return parse_response(json.loads(raw.decode("utf-8")))
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
+        category = cloudflare_http_error_category(exc)
+        if category == "daily_quota_exhausted":
+            message = "Cloudflare Workers AI исчерпал дневную квоту"
+        elif exc.code in (401, 403):
             message = "Cloudflare-корректор отклонил запрос (401/403)"
         elif exc.code == 429:
-            message = "Cloudflare-корректор достиг лимита (429)"
+            message = "Cloudflare-корректор временно ограничил запрос (429)"
         else:
             message = f"Ошибка Cloudflare-корректора (HTTP {exc.code})"
-        raise CloudflareError(message, "http_401_403" if exc.code in (401, 403) else "http_429" if exc.code == 429 else "http_error") from None
+        raise CloudflareError(message, category) from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise CloudflareError("Сетевая ошибка или тайм-аут Cloudflare-корректора", "timeout" if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError) else "network_error") from None
     except (json.JSONDecodeError, UnicodeDecodeError):
