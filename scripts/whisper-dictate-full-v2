@@ -4,4 +4,5 @@ exec env \
   WHISPER_DEVICE=cuda \
   WHISPER_COMPUTE_TYPE=int8_float16 \
   WHISPER_MODEL=large-v3 \
+  WHISPER_PROFILE=full \
   "$SCRIPT_DIR/whisper-dictate-v2"

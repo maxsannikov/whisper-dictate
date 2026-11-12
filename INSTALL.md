@@ -2,8 +2,8 @@
 
 Полная система голосового распознавания для OpenSUSE/Linux с интеграцией в KDE Plasma.
 
-**Версия:** 1.0  
-**Дата:** 2026-08-01  
+**Версия:** 1.2.0
+**Дата:** 2026-11-12
 **Платформа:** OpenSUSE Tumbleweed, KDE Plasma 5/6
 
 ---
@@ -67,15 +67,16 @@ ffmpeg -version
 
 ### 1. Скачать источник
 
-**Вариант А: Из LinuxBrain (локальный)**
+**Вариант А: Публичный GitHub репозиторий**
 ```bash
-cd ~/Documents/LinuxBrain/installation/whisper-dictate
+git clone https://github.com/maxsannikov/whisper-dictate.git
+cd whisper-dictate
 ```
 
-**Вариант Б: Из GitHub (будущее)**
+**Вариант Б: Из уже клонированного репозитория**
 ```bash
-git clone <github-repo> LinuxBrain
-cd LinuxBrain/installation/whisper-dictate
+cd /путь/к/whisper-dictate
+git pull --ff-only origin main
 ```
 
 ### 2. Запустить установку
@@ -402,27 +403,22 @@ rm -rf ~/.cache/whisper-dictate/youtube-audio/*
 
 ## Обновление
 
-### Из LinuxBrain
+### Обновление из публичного GitHub репозитория
 
 ```bash
-cd ~/Documents/LinuxBrain/installation/whisper-dictate
-git pull origin master  # Если синхронизировано с GitHub
-
-# Переустановить
+cd /путь/к/whisper-dictate
+git pull --ff-only origin main
 ./install.sh
 ```
 
 ### Ручное обновление
 
 ```bash
-# Проверить версию
-cat ~/.local/bin/whisper/VERSION 2>/dev/null || echo "unknown"
+# Проверить версию исходников
+cat metadata/VERSION
 
-# Скопировать новые файлы
-cp -r ~/Documents/LinuxBrain/installation/whisper-dictate/scripts/* ~/.local/bin/whisper/
-
-# Перезапустить
-systemctl --user restart whisper-daemon.service whisper-tray.service
+# Установить обновлённые файлы штатным установщиком
+./install.sh
 ```
 
 ---
@@ -491,5 +487,5 @@ Whisper Dictate использует [OpenAI Whisper](https://github.com/openai/
 
 ---
 
-**Последнее обновление:** 2026-08-01
+**Последнее обновление:** 2026-11-12
 

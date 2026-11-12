@@ -137,6 +137,13 @@ else
     warning "User guide not found; tray menu guide entry may not open"
 fi
 
+if [[ -f "$SCRIPT_DIR/metadata/CHANGELOG.md" ]]; then
+    cp "$SCRIPT_DIR/metadata/CHANGELOG.md" "$DOC_DIR/CHANGELOG.md"
+    success "Changelog installed to $DOC_DIR/CHANGELOG.md"
+else
+    warning "Changelog not found; tray menu changelog entry may not open"
+fi
+
 # ============================================================================
 # 4. Install Python dependencies
 # ============================================================================
@@ -255,14 +262,35 @@ fi
 # ============================================================================
 log "Creating KDE menu entry..."
 
-ICON_DIR="$HOME/.local/share/pixmaps"
-APP_ICON="microphone"
-if [[ -f "$SCRIPT_DIR/assets/whisper-dictate-icon.png" ]]; then
-    mkdir -p "$ICON_DIR"
-    APP_ICON="$ICON_DIR/whisper-dictate.png"
-    cp "$SCRIPT_DIR/assets/whisper-dictate-icon.png" "$APP_ICON"
-else
-    warning "Application icon asset not found; keeping the previous icon"
+STATUS_ICON_DIR="$HOME/.local/share/whisper-dictate/icons"
+if [[ -d "$SCRIPT_DIR/assets/status-icons" ]]; then
+    mkdir -p "$STATUS_ICON_DIR"
+    cp "$SCRIPT_DIR"/assets/status-icons/*.svg "$STATUS_ICON_DIR/"
+    for icon_png in "$SCRIPT_DIR"/assets/status-icons/*.png; do
+        [[ -f "$icon_png" ]] || continue
+        cp "$icon_png" "$STATUS_ICON_DIR/"
+    done
+    chmod 644 "$STATUS_ICON_DIR"/*.svg
+    for icon_png in "$STATUS_ICON_DIR"/*.png; do
+        [[ -f "$icon_png" ]] || continue
+        chmod 644 "$icon_png"
+    done
+    success "Provider status icons installed to $STATUS_ICON_DIR"
+fi
+
+MENU_ICON_DIR="$HOME/.local/share/whisper-dictate/menu-icons"
+if [[ -d "$SCRIPT_DIR/assets/menu-icons" ]]; then
+    mkdir -p "$MENU_ICON_DIR"
+    cp "$SCRIPT_DIR"/assets/menu-icons/*.png "$MENU_ICON_DIR/"
+    chmod 644 "$MENU_ICON_DIR"/*.png
+    success "Tray menu icons installed to $MENU_ICON_DIR"
+fi
+
+# Keep KDE's launcher icon identical to the idle tray icon.
+APP_ICON="$MENU_ICON_DIR/microphone.png"
+if [[ ! -f "$APP_ICON" ]]; then
+    APP_ICON="microphone"
+    warning "Shared tray/launcher microphone icon is missing; using the theme fallback"
 fi
 
 cat > "$DESKTOP_DIR/whisper-dictate.desktop" << EOF

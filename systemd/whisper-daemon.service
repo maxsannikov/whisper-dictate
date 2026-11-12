@@ -20,6 +20,9 @@ StandardError=journal
 
 # Environment setup
 Environment="PYTHONUNBUFFERED=1"
+PassEnvironment=http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+Environment="NO_PROXY=localhost,127.0.0.1,::1"
+Environment="no_proxy=localhost,127.0.0.1,::1"
 
 [Install]
 WantedBy=default.target

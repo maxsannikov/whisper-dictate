@@ -2,10 +2,14 @@
 set -euo pipefail
 
 STATE="$HOME/.cache/whisper-dictate"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PIDS_DIR="$STATE/pids"
 QUEUE_DIR="$STATE/queue"
 RESULTS_DIR="$STATE/results"
 JOBS_DIR="$STATE/jobs"
+HOTKEY_LOCK="$STATE/.hotkey-recording.lock"
+ACTIVE_RECORDING="$STATE/.active-recording"
+PROFILE_NAME="${WHISPER_PROFILE:-default}"
 
 mkdir -p "$PIDS_DIR" "$QUEUE_DIR" "$RESULTS_DIR" "$JOBS_DIR"
 
@@ -178,6 +182,7 @@ write_job() {
 remove_job() {
     [[ -n "$BATCH_ID" ]] && return 0
     rm -f "$JOBS_DIR/${1}.json" 2>/dev/null || true
+    rm -f "$STATE/raw-asr/${1}.txt" "$STATE/recovery-cancel/${1}.cancel" 2>/dev/null || true
 }
 
 # Удалить исходный audio-файл ТОЛЬКО если это временная запись микрофона
@@ -309,6 +314,8 @@ async_transcribe() {
     local mode_file="$RESULTS_DIR/${timestamp}.mode"
     local device_file="$RESULTS_DIR/${timestamp}.device"
     local correction_file="$RESULTS_DIR/${timestamp}.correction"
+    local backend_file="$RESULTS_DIR/${timestamp}.backend"
+    local correction_mode_file="$RESULTS_DIR/${timestamp}.correction_mode"
 
     # Выполнить транскрипцию через демон (с fallback на прямой вызов)
     local t0=$(date +%s%N)
@@ -317,7 +324,7 @@ async_transcribe() {
     local asr_error_file="$RESULTS_DIR/${timestamp}.error"
     if [[ "$cloudflare_enabled" == "cloudflare" ]]; then
         : > "$STATE/cloudflare.log"
-        if ! text=$("$HOME/.local/bin/whisper/whisper-daemon-client.sh" "$wav" "$mode_file" "$device_file" "" "$correction_file" 2>"$STATE/cloudflare.log"); then
+        if ! text=$("$HOME/.local/bin/whisper/whisper-daemon-client.sh" "$wav" "$mode_file" "$device_file" "" "$correction_file" "$backend_file" "$correction_mode_file" 2>"$STATE/cloudflare.log"); then
             local error_message
             error_message=$(tail -n 1 "$STATE/cloudflare.log" | cut -c1-180)
             [[ -n "$error_message" ]] || error_message="Ошибка Cloudflare Workers AI"
@@ -333,7 +340,7 @@ async_transcribe() {
             remove_job "$timestamp"; rm -f "$pidfile"; cleanup_wav "$wav"; return 1
         fi
     else
-        text=$("$HOME/.local/bin/whisper/whisper-daemon-client.sh" "$wav" "$mode_file" "$device_file" "" "$correction_file" 2>>"$STATE/daemon-client.log" || true)
+        text=$("$HOME/.local/bin/whisper/whisper-daemon-client.sh" "$wav" "$mode_file" "$device_file" "" "$correction_file" "$backend_file" "$correction_mode_file" 2>>"$STATE/daemon-client.log" || true)
     fi
     local t1=$(date +%s%N)
     echo $(( (t1 - t0) / 1000000 )) > "$RESULTS_DIR/${timestamp}.duration"
@@ -366,6 +373,7 @@ async_transcribe() {
         fi
         remove_job "$timestamp"
         rm -f "$pidfile"
+        rm -f "$backend_file"
         cleanup_wav "$wav"
         return 1
     fi
@@ -376,6 +384,7 @@ async_transcribe() {
         mkdir -p "$(dirname "$OUTPUT_PATH")"
         echo "$text" > "$OUTPUT_PATH"
         echo "[batch:$BATCH_ID] ✓ $wav → $OUTPUT_PATH" >> "$STATE/tray.log" 2>/dev/null || true
+        rm -f "$backend_file" "$RESULTS_DIR/${timestamp}.model"
         rm -f "$pidfile"
         cleanup_wav "$wav"
         return 0
@@ -384,7 +393,9 @@ async_transcribe() {
     # Сохранить результат в файл (для очереди результатов)
     local result_file="$RESULTS_DIR/${timestamp}.txt"
     echo "$text" > "$result_file"
-    if [[ "$WHISPER_ASR_PROVIDER" == "cloudflare" ]]; then
+    if [[ -s "$backend_file" ]]; then
+        cat "$backend_file" > "$RESULTS_DIR/${timestamp}.model"
+    elif [[ "$WHISPER_ASR_PROVIDER" == "cloudflare" ]]; then
         if [[ "$(cat "$mode_file" 2>/dev/null || true)" == "cloudflare_fallback" ]]; then
             echo "$MODEL_NAME" > "$RESULTS_DIR/${timestamp}.model"
         else
@@ -436,13 +447,21 @@ result_processor_loop() {
             local device_file_r="$RESULTS_DIR/${timestamp}.device"
             local duration_file="$RESULTS_DIR/${timestamp}.duration"
             local correction_file_r="$RESULTS_DIR/${timestamp}.correction"
+            local correction_mode_file="$RESULTS_DIR/${timestamp}.correction_mode"
             local model=$(cat "$model_file" 2>/dev/null || echo "Unknown")
             local mode=$(cat "$mode_file_r" 2>/dev/null || echo "unknown")
             local device=$(cat "$device_file_r" 2>/dev/null || echo "unknown")
             local duration_ms=$(cat "$duration_file" 2>/dev/null || echo 0)
             local correction_fallback=$(cat "$correction_file_r" 2>/dev/null || true)
+            local correction_mode=$(cat "$correction_mode_file" 2>/dev/null || true)
 
             # Определить красивое имя модели
+            local actual_backend="" actual_model="$model"
+            if [[ "$model" == *\|* ]]; then
+                actual_backend="${model%%|*}"
+                actual_model="${model#*|}"
+            fi
+
             case "$model" in
                 large-v3) local display_model="Whisper Full (Large-v3)" ;;
                 medium) local display_model="Whisper Medium" ;;
@@ -450,6 +469,32 @@ result_processor_loop() {
                 @cf/openai/whisper-large-v3-turbo) local display_model="Whisper Cloudflare Workers AI" ;;
                 *) local display_model="Whisper ($model)" ;;
             esac
+            if [[ -n "$actual_backend" ]]; then
+                case "$actual_backend" in
+                    faster-whisper) display_model="FasterWhisper · $actual_model" ;;
+                    gigaam-v3-e2e-rnnt) display_model="GigaAM-v3 e2e_rnnt · CPU" ;;
+                    gigaam-v3-e2e-ctc-onnx-gpu)
+                        if [[ "$device" == "cpu" ]]; then
+                            display_model="GigaAM-v3 e2e_ctc · CPU"
+                        elif [[ "$device" == "cuda" ]]; then
+                            display_model="GigaAM-v3 e2e_ctc · GPU"
+                        else
+                            display_model="GigaAM-v3 e2e_ctc"
+                        fi
+                        ;;
+                    gigaam-v3-ctc-onnx-gpu)
+                        if [[ "$device" == "cpu" ]]; then
+                            display_model="GigaAM-v3 ctc · CPU"
+                        elif [[ "$device" == "cuda" ]]; then
+                            display_model="GigaAM-v3 ctc · GPU"
+                        else
+                            display_model="GigaAM-v3 ctc"
+                        fi
+                        ;;
+                    cloudflare) display_model="Cloudflare · $actual_model" ;;
+                    *) display_model="$actual_backend · $actual_model" ;;
+                esac
+            fi
 
             # Создать метку режима работы с эмодзи
             local mode_label=""
@@ -459,8 +504,8 @@ result_processor_loop() {
                 mode_label="☁️ Аудио отправлено в Cloudflare"
             else
             case "${mode}_${device}" in
-                daemon_cuda) mode_label="⚡ Демон (GPU)" ;;
-                daemon_cpu)  mode_label="⚡ Демон (CPU?!)" ;;
+                    daemon_cuda) mode_label="⚡ Демон (GPU)" ;;
+                    daemon_cpu)  mode_label="⚡ Демон (CPU)" ;;
                 direct_cuda) mode_label="🐢 Прямой (GPU)" ;;
                 direct_cpu)  mode_label="🔥 Прямой (CPU, медленно!)" ;;
                 *)
@@ -473,17 +518,20 @@ result_processor_loop() {
             esac
             fi
 
-            if [[ "${XDG_SESSION_TYPE:-wayland}" == "wayland" ]]; then
-                printf '%s' "$text" | wl-copy 2>/dev/null
-            elif [[ "${XDG_SESSION_TYPE:-}" == "x11" ]]; then
-                printf '%s' "$text" | xclip -selection clipboard 2>/dev/null
+            case "$correction_mode" in
+                raw_asr_manual_busy)
+                    mode_label="${mode_label:+$mode_label · }⚠️ Без live-коррекции: ручной корректор занят"
+                    ;;
+                live_correction_disabled)
+                    mode_label="${mode_label:+$mode_label · }Коррекция для диктовки отключена"
+                    ;;
+            esac
+
+            if printf '%s' "$text" | /usr/bin/python3 "$SCRIPT_DIR/clipboard_delivery.py" >/dev/null 2>&1; then
+                echo "[$(date)] ✓ Буфер обмена и история Klipper обновлены ($(echo -n "$text" | wc -c) байт)" >> "$STATE/autopaste.log"
             else
-                false
-            fi && {
-                echo "[$(date)] ✓ В буфер обмена успешно ($(echo -n "$text" | wc -c) байт)" >> "$STATE/autopaste.log"
-            } || {
-                echo "[$(date)] ✗ Ошибка буфера обмена: ни wl-copy ни xclip не сработали" >> "$STATE/autopaste.log"
-            }
+                echo "[$(date)] ✗ Не удалось обновить буфер обмена или историю Klipper" >> "$STATE/autopaste.log"
+            fi
 
             # Show only an ephemeral preview; transcription text is never written to logs.
             local preview
@@ -502,7 +550,7 @@ result_processor_loop() {
             fi
 
             # Удалить обработанные файлы и запись о задании
-            rm -f "$oldest_result" "$model_file" "$mode_file_r" "$device_file_r" "$duration_file" "$correction_file_r"
+            rm -f "$oldest_result" "$model_file" "$mode_file_r" "$device_file_r" "$duration_file" "$correction_file_r" "$correction_mode_file" "$RESULTS_DIR/${timestamp}.backend"
             remove_job "$timestamp"
         else
             # Нет результатов, подождать
@@ -521,15 +569,15 @@ result_processor_loop() {
 # =========================
 stop_recording() {
     local last_pid
-    last_pid=$(find_last_pid)
+    last_pid="${1:-$(find_last_pid)}"
 
     if [[ -z "$last_pid" ]]; then
-        notify-send "$DISPLAY_MODEL" "⚠️ No active recording"
+        notify-send "Whisper Dictate" "⚠️ Нет активной записи"
         return 0
     fi
 
     # Завершить ffmpeg
-    notify-send "$DISPLAY_MODEL" "⏹️ Processing... (queued)"
+    notify-send "Whisper Dictate" "⏹️ Запись завершена · обработка в очереди"
     kill "$last_pid" 2>/dev/null || true
     [[ "$AUDIO_DUCK_ENABLED" == "true" && -x "$AUDIO_DUCK_HELPER" ]] && "$AUDIO_DUCK_HELPER" stop "$AUDIO_DUCK_TARGET" "$AUDIO_DUCK_FADE_MS" &
 
@@ -553,6 +601,7 @@ stop_recording() {
 
     # Обновить статус задания на "processing"
     write_job "$timestamp" "processing" "unknown" "" "$STRATEGY" "microphone"
+    rm -f "$ACTIVE_RECORDING"
 
     # Запустить асинхронную транскрипцию в фоне
     async_transcribe "$wav" "$pidfile" &
@@ -570,7 +619,7 @@ start_recording() {
     local pidfile="$PIDS_DIR/$timestamp.pid"
     local wav="$STATE/rec-$timestamp.wav"
 
-    notify-send "$DISPLAY_MODEL" "🎤 Recording..."
+    notify-send "Whisper Dictate" "🎙️ Запись"
 
     [[ "$AUDIO_DUCK_ENABLED" == "true" && -x "$AUDIO_DUCK_HELPER" ]] && "$AUDIO_DUCK_HELPER" start "$AUDIO_DUCK_TARGET" "$AUDIO_DUCK_FADE_MS" &
 
@@ -581,6 +630,7 @@ start_recording() {
 
     local ffmpeg_pid=$!
     echo "$ffmpeg_pid" > "$pidfile"
+    printf '%s\t%s\t%s\n' "$ffmpeg_pid" "$PROFILE_NAME" "$DISPLAY_MODEL" > "$ACTIVE_RECORDING"
 
     # Создать запись о начале задания
     write_job "$timestamp" "recording" "unknown" "" "$STRATEGY" "microphone"
@@ -621,13 +671,26 @@ if [[ -n "$AUDIO_FILE" ]]; then
     fi
 else
     # Обычный режим: запись через hotkey или остановка
-    last_pid=$(find_last_pid)
-
-    if [[ -n "$last_pid" ]] && is_alive "$last_pid"; then
-        # Есть активная запись → STOP
-        stop_recording
+    # Один lock атомарно объединяет проверку активной записи и запуск/остановку,
+    # чтобы разные profile hotkeys не стартовали параллельные ffmpeg-процессы.
+    exec 9>"$HOTKEY_LOCK"
+    flock -x 9
+    active_pid=""
+    active_profile=""
+    if [[ -f "$ACTIVE_RECORDING" ]]; then
+        IFS=$'\t' read -r active_pid active_profile _active_label < "$ACTIVE_RECORDING" || true
+    fi
+    if [[ -n "$active_pid" ]] && is_alive "$active_pid"; then
+        if [[ "$PROFILE_NAME" == "$active_profile" ]]; then
+            # То же сочетание → завершить текущую запись.
+            stop_recording "$active_pid"
+        else
+            notify-send "$DISPLAY_MODEL" "⚠️ Уже записывает профиль ${active_profile}. Остановите его тем же сочетанием клавиш перед сменой профиля."
+        fi
     else
-        # Нет активной записи → START
+        # Убрать marker от аварийно завершённой записи перед новым стартом.
+        rm -f "$ACTIVE_RECORDING"
         start_recording
     fi
+    flock -u 9
 fi

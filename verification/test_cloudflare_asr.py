@@ -67,7 +67,8 @@ class CloudflareResponseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             metrics = Path(directory) / "metrics.jsonl"
             metrics.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
-            usage = cloudflare_asr.daily_usage(metrics, now)
+            with patch.object(cloudflare_asr, "USAGE_PATH", Path(directory) / "usage.json"):
+                usage = cloudflare_asr.daily_usage(metrics, now)
         self.assertEqual(usage["requests"], 1)
         self.assertEqual(usage["audio_seconds"], 120)
         self.assertAlmostEqual(usage["estimated_neurons"], 2 * 46.63)
@@ -75,6 +76,23 @@ class CloudflareResponseTests(unittest.TestCase):
         self.assertEqual(usage["corrector_requests"], 2)
         self.assertEqual(usage["corrector_estimated_token_requests"], 1)
         self.assertEqual(usage["corrector_estimated_neurons"], 2.25)
+
+    def test_estimated_neuron_budget_reserves_atomically_and_resets_at_utc_midnight(self):
+        now = cloudflare_asr.datetime(2026, 10, 23, 23, 59, tzinfo=cloudflare_asr.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = Path(directory) / "metrics.jsonl"
+            state = Path(directory) / "cloudflare-usage.json"
+            self.assertTrue(cloudflare_asr.reserve_daily_neurons(metrics, 9900, state, now))
+            self.assertFalse(cloudflare_asr.reserve_daily_neurons(metrics, 101, state, now))
+            self.assertTrue(cloudflare_asr.reserve_daily_neurons(metrics, 100, state, now))
+            self.assertFalse(cloudflare_asr.reserve_daily_neurons(metrics, 0.1, state, now))
+            next_day = cloudflare_asr.datetime(2026, 10, 24, 0, 0,
+                                               tzinfo=cloudflare_asr.timezone.utc)
+            self.assertTrue(cloudflare_asr.reserve_daily_neurons(metrics, 100, state, next_day))
+            with patch.object(cloudflare_asr, "USAGE_PATH", state):
+                usage = cloudflare_asr.daily_usage(metrics, next_day)
+            self.assertAlmostEqual(usage["reserved_neurons"], 100)
+            self.assertAlmostEqual(usage["estimated_remaining"], 9900)
 
     def test_http_error_log_does_not_include_secrets_or_response_body(self):
         token = "test-api-token-must-never-appear"
@@ -131,11 +149,11 @@ class CloudflareResponseTests(unittest.TestCase):
         self.assertIn("cloudflare_daily_usage(METRICS_FILE)", source)
         self.assertIn('cloudflare_submenu.connect("show", refresh_cloudflare_usage)', source)
         self.assertNotIn("Оценка расхода по локальным метрикам", source)
-        self.assertIn("~{total:,} нейронов", source)
+        self.assertIn("~{fmt(int(usage['estimated_neurons']))} нейронов", source)
 
     def test_tray_uses_single_cloud_gpu_or_cpu_status_icon(self):
         source = (Path(__file__).parents[1] / "scripts" / "whisper-tray.py").read_text(encoding="utf-8")
-        self.assertIn('"processing_cloudflare": "/usr/share/icons/Papirus/24x24/actions/cloud-download.svg"', source)
+        self.assertIn('"processing_cloudflare": provider_status_icon("cloudflare"', source)
         self.assertIn('"processing_gpu": "/usr/share/icons/Papirus/24x24/devices/input-gaming.svg"', source)
         self.assertIn('"processing_cpu": "/usr/share/icons/Papirus/24x24/devices/cpu.svg"', source)
         self.assertIn('indicator.set_icon_full(icon, tooltip)', source)

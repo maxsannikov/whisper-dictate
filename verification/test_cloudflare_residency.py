@@ -24,6 +24,10 @@ def daemon_function(name, **overrides):
     namespace = {
         "asyncio": asyncio, "gc": __import__("gc"), "json": json,
         "urllib": urllib, "logger": logging.getLogger("residency-test"),
+        "GIGAAM_MODEL_NAME": "GigaAM-v3 e2e_rnnt",
+        "GIGAAM_ONNX_BACKENDS": {},
+        "GIGAAM_BACKENDS": {"gigaam-v3-e2e-rnnt"},
+        "gigaam_worker": None, "gigaam_onnx_worker": None,
     }
     namespace.update(overrides)
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(DAEMON_PATH), "exec"), namespace)
@@ -39,11 +43,18 @@ def load_config_function(config_path):
                  and node.name in {"clone_default", "restore_local_profile_defaults", "config"}]
     namespace = {
         "DEFAULT_CLOUDFLARE_CORRECTOR": "@cf/qwen/qwen3-30b-a3b-fp8",
+        "CLOUDFLARE_CORRECTOR_MODELS": ("@cf/qwen/qwen3-30b-a3b-fp8",
+                                         "@cf/zai-org/glm-4.7-flash"),
         "MODEL_NEURON_RATES": {"@cf/qwen/qwen3-30b-a3b-fp8": (1, 1),
                                "@cf/zai-org/glm-4.7-flash": (1, 1)},
         "MODELS": {"large-v3", "large-v3-turbo", "medium", "small"},
         "COMPUTES": {"int8_float16", "float16", "int8", "float32"},
+        "GIGAAM_BACKENDS": {"gigaam-v3-e2e-rnnt", "gigaam-v3-e2e-ctc-onnx-gpu",
+                            "gigaam-v3-ctc-onnx-gpu"},
+        "GIGAAM_ONNX_BACKENDS": {},
+        "safe_provider_settings": lambda value: value if isinstance(value, dict) else {},
         "CONFIG": Path(config_path), "json": json, "logger": logging.getLogger("config-test"),
+        "HOME": Path.home(),
     }
     exec(compile(ast.Module(body=[default, *functions], type_ignores=[]), "daemon-config-test", "exec"), namespace)
     return namespace["config"]
@@ -65,8 +76,10 @@ class CloudflareResidencyTests(unittest.TestCase):
     def test_invalid_local_profile_resets_locals_without_clearing_cloudflare_toggles(self):
         defaults = {key: None for key in ("model", "language", "device", "compute_type", "beam_size",
                    "best_of", "temperature", "vad", "condition_on_previous_text", "initial_prompt",
-                   "glossary", "result_mode", "fallback", "corrector")}
-        defaults.update({"model": "large-v3", "corrector": {"enabled": False}})
+                   "glossary", "result_mode", "fallback", "corrector", "asr_backend",
+                   "gigaam_model_dir")}
+        defaults.update({"model": "large-v3", "asr_backend": "faster-whisper",
+                         "corrector": {"enabled": False}})
         restore, _ = daemon_function("restore_local_profile_defaults",
             clone_default=lambda: dict(defaults))
         value = dict(defaults, model="invalid", cloudflare_asr_enabled=True,
@@ -165,34 +178,41 @@ class CloudflareResidencyTests(unittest.TestCase):
         self.assertEqual(events, [("sleep", 2.0), ("unload", "qwen-local")])
 
     def test_cloudflare_asr_releases_models_and_forces_local_fallback(self):
-        run = SOURCE[SOURCE.index("async def run(job):"):SOURCE.index("\nasync def worker", SOURCE.index("async def run(job):"))]
-        cloud_call = run.index("await cloudflare_first(")
+        run_start = SOURCE.index("async def run(job, asr_only=True):")
+        run = SOURCE[run_start:SOURCE.index("\nasync def correction_stage", run_start)]
+        cloud_call = run.index('elif route == "cloudflare":')
         local_load = run.index("cold = await prepare_local_asr(value)")
         remote_release = run.index('await prepare_remote_models(value["corrector"]["model"])')
-        self.assertIn("local_transcribe, True)", run)
+        self.assertIn("multi_asr_chain", run)
+        self.assertIn('elif route == "google":', run)
         self.assertLess(remote_release, cloud_call)
-        self.assertLess(local_load, cloud_call)
+        self.assertLess(cloud_call, local_load)
         self.assertNotIn('job["cloudflare_fallback_local"]', run)
         self.assertIn("await ensure(retry)", run)
         self.assertIn("await ensure(retry)", run)
 
     def test_cloudflare_corrector_releases_whisper_after_asr(self):
-        run = SOURCE[SOURCE.index("async def run(job):"):SOURCE.index("\nasync def worker", SOURCE.index("async def run(job):"))]
+        run_start = SOURCE.index("async def run(job, asr_only=True):")
+        run = SOURCE[run_start:SOURCE.index("\nasync def correction_stage", run_start)]
+        correction_start = SOURCE.index("async def correction_stage(job, asr_result):")
+        correction = SOURCE[correction_start:SOURCE.index("\nasync def finish_job", correction_start)]
         asr_end = run.index("elapsed = time.monotonic() - t0")
-        correction_release = run.index("if cloud_corrector.get(\"enabled\")")
-        local_qwen = run.index("correct_text_sync, text, corrector")
-        self.assertLess(asr_end, correction_release)
+        correction_release = correction.index("if any(route != \"local\" for route in correction_routes)")
+        local_qwen = correction.index("correct_text_sync, text, corrector")
+        self.assertLess(asr_end, run.index("if asr_only:"))
         self.assertLess(correction_release, local_qwen)
-        self.assertIn('select_job_backends(job.get("source"), value)', run)
-        self.assertIn('await prepare_remote_models(corrector["model"])', run)
-        self.assertIn("delayed_qwen_release(corrector[\"model\"])", run)
+        self.assertIn('select_job_backends(job.get("source"), value)', correction)
+        self.assertIn("multi_correction_chain", correction)
+        self.assertIn('await prepare_remote_models(corrector["model"])', correction)
+        self.assertIn("delayed_qwen_release(corrector[\"model\"])", correction)
 
-    def test_cloudflare_correction_error_forces_local_qwen_if_local_toggle_is_off(self):
+    def test_cloudflare_correction_error_does_not_force_qwen_if_local_toggle_is_off(self):
         start = SOURCE.index("def correct_text_sync(")
         end = SOURCE.index("\ndef large_corrector_profile", start)
         body = SOURCE[start:end]
-        self.assertIn('corrector["enabled"] = True', body)
-        self.assertIn('"local_fallback" if cloudflare_fallback else "local"', body)
+        self.assertNotIn('corrector["enabled"] = True', body)
+        self.assertIn("A disabled local corrector must stay unloaded", body)
+        self.assertIn('"local_fallback" if fallback_stage else "local"', body)
 
     def test_remote_preparation_releases_whisper_then_ollama_qwen(self):
         events = []
@@ -208,12 +228,25 @@ class CloudflareResidencyTests(unittest.TestCase):
     def test_local_asr_unloads_qwen_then_ensures_whisper(self):
         events = []
         async def to_thread(function, *args): return function(*args)
-        async def ensure(_profile): events.append("whisper"); return True
+        async def ensure(_profile, **_kwargs): events.append("whisper"); return True
         def unload(_model): events.append("qwen")
         prepare, _ = daemon_function("prepare_local_asr", asyncio=SimpleNamespace(to_thread=to_thread),
-                                     ensure=ensure, unload_corrector_model=unload)
+                                     ensure=ensure, unload_corrector_model=unload,
+                                     local_corrector_model_names=lambda _profile: ["qwen-local", "qwen-fallback"])
         self.assertTrue(asyncio.run(prepare({"corrector": {"model": "qwen-local"}})))
-        self.assertEqual(events, ["qwen", "whisper"])
+        self.assertEqual(events, ["qwen", "qwen", "whisper"])
+
+    def test_gigaam_local_asr_unloads_qwen_before_switching_asr(self):
+        events = []
+        async def to_thread(function, *args): return function(*args)
+        async def ensure(_profile, **_kwargs): events.append("gigaam"); return False
+        def unload(_model): events.append("qwen")
+        prepare, _ = daemon_function("prepare_local_asr", asyncio=SimpleNamespace(to_thread=to_thread),
+                                     ensure=ensure, unload_corrector_model=unload,
+                                     local_corrector_model_names=lambda _profile: ["qwen-local", "qwen-fallback"])
+        self.assertFalse(asyncio.run(prepare({"asr_backend": "gigaam-v3-e2e-rnnt",
+                                              "corrector": {"model": "qwen-local"}})))
+        self.assertEqual(events, ["qwen", "qwen", "gigaam"])
 
     def test_whisper_load_error_propagates_without_repeating_load(self):
         loads = []
@@ -255,11 +288,14 @@ class CloudflareResidencyTests(unittest.TestCase):
         self.assertIn('"keep_alive": corrector["keep_alive"]', SOURCE)
 
     def test_fallback_whisper_is_retained_when_no_later_remote_stage_needs_it(self):
-        run = SOURCE[SOURCE.index("async def run(job):"):SOURCE.index("\nasync def worker", SOURCE.index("async def run(job):"))]
+        start = SOURCE.index("async def run(job, asr_only=True):")
+        run = SOURCE[start:SOURCE.index("\nasync def correction_stage", start)]
+        start = SOURCE.index("async def correction_stage(job, asr_result):")
+        correction = SOURCE[start:SOURCE.index("\nasync def finish_job", start)]
         self.assertIn("cold = await prepare_local_asr(value)", run)
-        self.assertIn("elif corrector.get(\"enabled\") and not large_cpu_corrector", run)
-        self.assertNotIn("await release()\n        text = await asyncio.to_thread(transcribe_sync", run)
-        self.assertIn("delayed_qwen_release(corrector[\"model\"])", run)
+        self.assertIn("elif corrector.get(\"enabled\") and not large_cpu_corrector", correction)
+        self.assertNotIn("await release()\n            text = await asyncio.to_thread(transcribe_sync", run)
+        self.assertIn("delayed_qwen_release(corrector[\"model\"])", correction)
         self.assertIn('"keep_alive": corrector["keep_alive"]', SOURCE)
 
     def test_local_qwen_stays_resident_when_ram_is_safe_or_unknown(self):

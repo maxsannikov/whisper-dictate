@@ -8,9 +8,11 @@ import unittest
 import urllib.error
 from pathlib import Path
 from unittest.mock import patch
-
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "verification"))
+from test_multi_provider import multi
+
 MODULE_PATH = ROOT / "scripts" / "cloudflare_corrector.py"
 spec = importlib.util.spec_from_file_location("cloudflare_corrector", MODULE_PATH)
 cloudflare_corrector = importlib.util.module_from_spec(spec)
@@ -21,8 +23,9 @@ def daemon_function(name, **overrides):
     source = (ROOT / "scripts" / "whisper-daemon.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == name)
+    safety = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "correction_is_safe")
     namespace = {
-        "time": time, "re": __import__("re"), "difflib": __import__("difflib"),
+        "time": time, "re": __import__("re"), "difflib": __import__("difflib"), "urllib": __import__("urllib.error"),
         "json": __import__("json"), "os": __import__("os"),
         "logger": logging.getLogger("test-cloudflare-corrector"),
         "CloudflareError": cloudflare_corrector.CloudflareError,
@@ -31,17 +34,96 @@ def daemon_function(name, **overrides):
         "CORRECTOR_INSTRUCTION": "Correct text.", "RETRY_INSTRUCTION": "Retry.",
         "correction_chunks": lambda text: [text],
         "correction_response": lambda text, _profile, _instruction: (text, "stop"),
-        "correction_is_safe": lambda _source, corrected, _reason: bool(corrected.strip()),
+        "ollama_loaded_device": lambda _model, requested: requested,
+        "unload_corrector_model": lambda _model: True,
+        "correction_safety_reason": lambda _source, corrected, _reason: None if corrected.strip() else "invalid",
+        "multi_correction_chain": lambda _source, _settings, cf_enabled: ["cloudflare", "local"] if cf_enabled else ["local"],
+        "safe_provider_settings": multi.safe_settings,
+        "CLOUDFLARE_CORRECTOR_MODELS": (cloudflare_corrector.DEFAULT_MODEL,),
+        "cloudflare_correction_model_order": lambda _metrics, models, _preferred=None: list(models),
+        "GIGAAM_BACKENDS": {"gigaam-v3-e2e-rnnt", "gigaam-v3-e2e-ctc-onnx-gpu",
+                            "gigaam-v3-ctc-onnx-gpu"},
+        "GIGAAM_ONNX_BACKENDS": {},
+        "ProviderError": type("ProviderError", (Exception,), {"__init__": lambda self, provider, category: (Exception.__init__(self, category), setattr(self, "provider", provider), setattr(self, "category", category))[-1]}),
+        "safe_provider_error_category": lambda error: getattr(error, "category", "other_error"),
         "cloudflare_correct": cloudflare_corrector.correct,
         "correction_token_counts": cloudflare_corrector.token_counts,
         "correction_neurons": cloudflare_corrector.estimate_neurons,
+        "estimate_cloudflare_correction_neurons": lambda *_args: 1,
+        "reserve_cloudflare_daily_neurons": lambda *_args: True,
+        "METRICS": ROOT / "synthetic-metrics.jsonl",
+        "daily_limit_state": lambda provider=None: None, "mark_daily_limit": lambda *_args: None,
+        "daily_only_routes": lambda routes: list(routes),
+        "record_attempt": lambda *_args, **_kwargs: None,
     }
     namespace.update(overrides)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(ROOT / "scripts" / "whisper-daemon.py"), "exec"), namespace)
+    exec(compile(ast.Module(body=[safety, node], type_ignores=[]), str(ROOT / "scripts" / "whisper-daemon.py"), "exec"), namespace)
     return namespace[name], namespace
 
 
 class CloudflareCorrectorTests(unittest.TestCase):
+    def test_disabled_local_corrector_stays_unloaded_after_cloudflare_failure(self):
+        class ProviderError(Exception):
+            def __init__(self, provider, category, *_args):
+                super().__init__(category)
+                self.provider = provider
+                self.category = category
+
+        class CloudflareError(Exception):
+            def __init__(self, *_args):
+                super().__init__("unavailable")
+                self.category = "network_error"
+
+        correction = {"enabled": True, "local_models": [],
+                      "codex_model": "codex", "claude_model": "claude",
+                      "codex_retry_attempts": 0, "claude_retry_attempts": 0,
+                      "groq_primary_retry_attempts": 0, "groq_fallback_retry_attempts": 0,
+                      "openrouter_retry_attempts": 0, "google_retry_attempts": 0}
+        calls = []
+        def raise_cloudflare(*_args):
+            calls.append("cloudflare")
+            raise CloudflareError()
+        correct, _namespace = daemon_function("correct_text_sync",
+            safe_provider_settings=lambda _value: {"correction": correction},
+            multi_correction_chain=lambda *_args: ["cloudflare", "local"],
+            daily_only_routes=lambda routes: list(routes),
+            daily_limit_state=lambda **_kwargs: None,
+            CLOUDFLARE_CORRECTOR_MODELS=("cf-model",),
+            cloudflare_correction_model_order=lambda *_args: ["cf-model"],
+            CloudflareError=CloudflareError, ProviderError=ProviderError,
+            safe_provider_error_category=lambda error: getattr(error, "category", "other_error"),
+            estimate_cloudflare_correction_neurons=lambda *_args: 1,
+            reserve_cloudflare_daily_neurons=lambda *_args: True,
+            cloudflare_correct=raise_cloudflare,
+            cloudflare_failure_callback=None,
+            record_attempt=lambda *_args, **_kwargs: None,
+            logger=__import__("logging").getLogger("disabled-local-corrector-test"),
+            CORRECTOR_INSTRUCTION="", RETRY_INSTRUCTION="",
+            METRICS=ROOT / "synthetic-metrics.jsonl")
+        result = correct("raw text", {"enabled": False, "provider": "ollama",
+            "model": "qwen-local", "prompt": "", "num_gpu": 8},
+            cloudflare_profile={"enabled": True, "model": "cf-model", "priority_model": "auto",
+                "retry_attempts": 0, "max_tokens": 128, "temperature": 0},
+            provider_settings={"correction": correction})
+        self.assertEqual(result[0], "raw text.")
+        self.assertEqual(result[3], "local_disabled")
+        self.assertEqual(calls, ["cloudflare"])
+
+    def test_guard_rejection_reasons_are_content_free(self):
+        source = (ROOT / "scripts/whisper-daemon.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "correction_safety_reason")
+        namespace = {"re": __import__("re"), "difflib": __import__("difflib")}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "guard-reasons", "exec"), namespace)
+        reason = namespace["correction_safety_reason"]
+        self.assertEqual(reason("extraordinarilylongword", "shortword", None), "length")
+        self.assertEqual(reason("supercalifragilisticexpialidocious a b", "supercalifragilisticexpialidocious a", None), "word_coverage_order")
+        self.assertEqual(reason("alpha " * 20, "bravo " * 20, None), "word_coverage_order")
+        self.assertEqual(reason("alpha beta gamma", "alpha beta unrelated", None), "tail")
+        self.assertEqual(reason("same words", None, None), "invalid")
+        repeated = "Сегодня проверили безопасные метрики, очередь задач пуста, а выбранная модель фиксируется без текста диктовки. "
+        self.assertEqual(reason(repeated * 2, repeated.strip(), None), "length")
+
     def test_default_model_and_supported_parameters(self):
         self.assertEqual(cloudflare_corrector.DEFAULT_MODEL, "@cf/qwen/qwen3-30b-a3b-fp8")
         class Response:
@@ -90,10 +172,10 @@ class CloudflareCorrectorTests(unittest.TestCase):
         self.assertNotEqual(cloudflare_corrector.estimate_neurons(100, 50),
                             cloudflare_corrector.estimate_neurons(100, 50, "@cf/zai-org/glm-4.7-flash"))
 
-    def test_cloudflare_failure_automatically_runs_local_corrector(self):
+    def test_cloudflare_failure_runs_local_corrector_when_enabled(self):
         correct_text, namespace = daemon_function("correct_text_sync")
         namespace["cloudflare_correct"] = lambda *_args: (_ for _ in ()).throw(CloudflareTestError("failed"))
-        result = correct_text("Synthetic complete sentence.", {"enabled": False, "provider": "ollama", "prompt": ""},
+        result = correct_text("Synthetic complete sentence.", {"enabled": True, "provider": "ollama", "prompt": "", "model": "qwen-local", "num_gpu": 0},
                               {"enabled": True, "model": cloudflare_corrector.DEFAULT_MODEL,
                                "temperature": 0.0, "max_tokens": 512})
         self.assertEqual(result[0], "Synthetic complete sentence.")
@@ -104,13 +186,13 @@ class CloudflareCorrectorTests(unittest.TestCase):
         correct_text, namespace = daemon_function("correct_text_sync")
         namespace["cloudflare_correct"] = lambda *_args: ("Synthetic complete sentence.", 4, 3)
         result = correct_text("Synthetic complete sentence.",
-            {"enabled": True, "provider": "ollama", "prompt": ""},
+            {"enabled": True, "provider": "ollama", "prompt": "", "model": "qwen-local", "num_gpu": 0},
             {"enabled": True, "model": cloudflare_corrector.DEFAULT_MODEL,
              "temperature": 0.0, "max_tokens": 512})
         self.assertEqual(result[3], "cloudflare")
         self.assertEqual(result[0], "Synthetic complete sentence.")
 
-    def test_all_cloud_failures_fall_back_to_local(self):
+    def test_all_cloud_failures_fall_back_to_local_when_enabled(self):
         correct_text, namespace = daemon_function("correct_text_sync")
         failures = [cloudflare_corrector.CloudflareError("401"),
                     cloudflare_corrector.CloudflareError("403"),
@@ -124,7 +206,7 @@ class CloudflareCorrectorTests(unittest.TestCase):
                     raise error
                 namespace["cloudflare_correct"] = fail_cloud
                 result = correct_text("Synthetic complete sentence.",
-                    {"enabled": False, "provider": "ollama", "prompt": ""},
+                    {"enabled": True, "provider": "ollama", "prompt": "", "model": "qwen-local", "num_gpu": 0},
                     {"enabled": True, "model": cloudflare_corrector.DEFAULT_MODEL,
                      "temperature": 0.0, "max_tokens": 512})
                 self.assertEqual(result[3], "local_fallback")
@@ -142,9 +224,10 @@ class CloudflareCorrectorTests(unittest.TestCase):
         self.assertIn('"cloudflare_asr_enabled": False', daemon)
         self.assertIn('"enabled": False, "model": DEFAULT_CLOUDFLARE_CORRECTOR', daemon)
 
-    def test_cloudflare_menu_is_top_level_and_backend_indicator_marks_cloud_only(self):
+    def test_unified_model_unload_and_backend_indicator_marks_cloud_only(self):
         source = (ROOT / "scripts" / "whisper-tray.py").read_text(encoding="utf-8")
-        self.assertIn('menu.append(cloudflare_menu_item)\nmenu.append(whisper_settings_item)', source)
+        self.assertIn('models_unload_item = primary_menu_item("Выгрузить все модели"', source)
+        self.assertIn('menu.append(models_unload_item)', source)
         self.assertIn('def processing_status_label(model, stage, icon_key, icon_label=None):', source)
         daemon = (ROOT / "scripts" / "whisper-daemon.py").read_text(encoding="utf-8")
         self.assertIn('"corrector_backend":correction_backend', daemon)

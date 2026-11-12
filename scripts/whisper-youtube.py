@@ -8,7 +8,53 @@
 
 import re
 import unicodedata
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlunparse
+
+
+def resolve_metadata_batch(entries, resolve_one):
+    """Resolve each input independently and return ordered success/error slots.
+
+    ``resolve_one(entry)`` returns metadata or raises TimeoutError/OSError.
+    Error records deliberately contain no provider stderr or response body.
+    """
+    resolved, failed = [], []
+    seen = set()
+    for index, original in enumerate(entries):
+        entry = dict(original)
+        key = entry.get("url")
+        if key and key in seen:
+            failed.append({**entry, "input_index": index,
+                           "reason": "duplicate", "status": "duplicate"})
+            continue
+        if key:
+            seen.add(key)
+        try:
+            metadata = resolve_one(entry)
+            if not isinstance(metadata, dict) or not metadata.get("video_id"):
+                raise ValueError("invalid_metadata")
+            resolved.append({**metadata, "input_index": index,
+                             "url": entry.get("url"), "status": "metadata_ok"})
+        except TimeoutError:
+            failed.append({**entry, "input_index": index,
+                           "reason": "metadata_timeout", "status": "metadata_timeout"})
+        except OSError:
+            failed.append({**entry, "input_index": index,
+                           "reason": "ytdlp_start_failed", "status": "metadata_error"})
+        except Exception:
+            failed.append({**entry, "input_index": index,
+                           "reason": "metadata_error", "status": "metadata_error"})
+    return sorted(resolved, key=lambda item: item["input_index"]), sorted(
+        failed, key=lambda item: item["input_index"])
+
+
+def download_state(entry, process):
+    """Build a per-input download state, including synchronous spawn failures."""
+    if process is None:
+        return {"proc": None, "entry": entry, "progress": 0.0, "eta_sec": None,
+                "error": {"code": "launch_failed", "message": "Не удалось запустить yt-dlp"},
+                "status": "download_error"}
+    return {"proc": process, "entry": entry, "progress": 0.0,
+            "eta_sec": None, "error": None, "status": "downloading"}
 
 
 def sanitize_filename(name, max_len=80):
@@ -236,7 +282,7 @@ def normalize_youtube_url(video_id):
 
 def parse_youtube_urls(text):
     """
-    Разобрать многострочный ввод с YouTube-ссылками.
+    Разобрать многострочный ввод с URL YouTube, RuTube и VK.
 
     Разделители: перевод строки, запятая, точка с запятой, пробел (в начало новой).
 
@@ -267,8 +313,23 @@ def parse_youtube_urls(text):
         if not line:
             continue
 
-        # Попробовать извлечь ID
-        video_id = extract_video_id(line)
+        # Разрешаем только известные видеохосты и http(s), чтобы не передавать
+        # произвольные схемы/домены в yt-dlp. Поддомены принимаются по границе.
+        candidate = line if re.match(r'^https?://', line, re.I) else 'https://' + line
+        try:
+            parsed = urlparse(candidate)
+            host = (parsed.hostname or '').lower().rstrip('.')
+        except ValueError:
+            parsed, host = None, ''
+        platform = None
+        if parsed and parsed.scheme in ('http', 'https') and not parsed.username and not parsed.password:
+            if host == 'youtu.be' or host == 'youtube.com' or host.endswith('.youtube.com'):
+                platform = 'youtube'
+            elif host == 'rutube.ru' or host.endswith('.rutube.ru'):
+                platform = 'rutube'
+            elif host in ('vk.com', 'm.vk.com', 'vkvideo.ru', 'm.vkvideo.ru') or host.endswith('.vk.com'):
+                platform = 'vk'
+        video_id = extract_video_id(line) if platform == 'youtube' else None
 
         entry = {
             "raw": line,
@@ -276,26 +337,55 @@ def parse_youtube_urls(text):
             "video_id": None,
             "start_sec": None,
             "playlist_id": None,
+            "platform": platform,
+            "source": platform,
             "valid": False,
             "error": None
         }
 
-        if not video_id:
+        if platform == 'youtube' and not video_id:
             # Классифицировать ошибку
             if 'youtube' not in line.lower() and 'youtu.be' not in line.lower():
                 entry["error"] = "not_youtube"
             else:
                 entry["error"] = "no_video_id"
-        else:
+        elif platform == 'youtube':
             entry["video_id"] = video_id
             entry["url"] = normalize_youtube_url(video_id)
             entry["start_sec"] = parse_time_param(line)
             entry["playlist_id"] = extract_playlist_id(line)
             entry["valid"] = True
+        elif platform:
+            # Для RuTube/VK идентификаторы и формы URL определяет yt-dlp.
+            entry["url"] = urlunparse(parsed._replace(scheme='https', fragment=''))
+            entry["valid"] = True
+        else:
+            entry["error"] = "unsupported_host"
 
         results.append(entry)
 
     return results
+
+
+def source_for_url(url):
+    """Return a supported video source label, or None for an unknown URL."""
+    if not isinstance(url, str):
+        return None
+    candidate = url if re.match(r'^https?://', url, re.I) else 'https://' + url
+    try:
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or '').lower().rstrip('.')
+    except ValueError:
+        return None
+    if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password:
+        return None
+    if host == 'youtu.be' or host == 'youtube.com' or host.endswith('.youtube.com'):
+        return 'youtube'
+    if host == 'rutube.ru' or host.endswith('.rutube.ru'):
+        return 'rutube'
+    if host in ('vk.com', 'm.vk.com', 'vkvideo.ru', 'm.vkvideo.ru') or host.endswith('.vk.com'):
+        return 'vk'
+    return None
 
 
 def dedupe_youtube_entries(entries):
